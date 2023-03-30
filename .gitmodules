@@ -1,0 +1,6 @@
+[submodule "3rd_party/LPTorch"]
+	path = 3rd_party/LPTorch
+	url = https://github.com/SpringWave1/LPTorch.git
+[submodule "3rd_party/transformers"]
+	path = 3rd_party/transformers
+	url = https://github.com/huggingface/transformers.git
