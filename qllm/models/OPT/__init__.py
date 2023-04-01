@@ -1,0 +1,1 @@
+from .seq_layers import OPTForCausalLMSeq

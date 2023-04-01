@@ -1,8 +1,10 @@
 import torch
 from transformers import (
     BloomConfig,
-    BloomForCausalLM
+    BloomForCausalLM,
+    AutoTokenizer
 )
+from transformers import BloomTokenizerFast
 # according to its original paper: https://arxiv.org/pdf/2211.05100.pdf, paper 21
 model_cards = {
     '560M': BloomConfig(
@@ -38,7 +40,7 @@ model_cards = {
 }
 
 def get_empty_model(model_size:str='125M'):
-    assert model_size in model_cards, f"model size {model_size}b not available"
+    assert model_size in model_cards, f"model size {model_size} not available"
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
@@ -47,8 +49,12 @@ def get_empty_model(model_size:str='125M'):
     config = model_cards[model_size]
     # model = LlamaModel(config)
     model = BloomForCausalLM(config)
-    return model
+    # tokenizer = BloomTokenizerFast.from_pretrained("bigscience/bloom")
+    tokenizer = AutoTokenizer.from_pretrained("facebook/bloom")
+    return model, tokenizer
 
+def get_available_models():
+    return model_cards.keys()
 
 AVAILABLE_MAP = {
     "bigscience/bloom": "https://huggingface.co/bigscience/bloom/resolve/main/config.json",
@@ -62,4 +68,8 @@ AVAILABLE_MAP = {
 def load_pretained_model_from_net(repo_name):
     assert repo_name in AVAILABLE_MAP, f"model {repo_name} not available in repo"
     model = BloomForCausalLM.from_pretrained(repo_name)
-    return model
+    tokenizer = AutoTokenizer.from_pretrained(repo_name)
+    return model, tokenizer
+
+def get_available_pretained_models():
+    return AVAILABLE_MAP.keys()

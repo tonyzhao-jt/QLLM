@@ -1,8 +1,10 @@
 import torch
 from transformers import (
     OPTConfig,
-    OPTForCausalLM
+    OPTForCausalLM,
+    AutoTokenizer
 )
+
 # according to its original paper: https://arxiv.org/pdf/2205.01068.pdf
 model_cards = {
     '125M': OPTConfig(
@@ -53,7 +55,7 @@ model_cards = {
 }
 
 def get_empty_model(model_size:str='125M'):
-    assert model_size in model_cards, f"model size {model_size}b not available"
+    assert model_size in model_cards, f"model size {model_size} not available"
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
@@ -62,8 +64,11 @@ def get_empty_model(model_size:str='125M'):
     config = model_cards[model_size]
     # model = LlamaModel(config)
     model = OPTForCausalLM(config)
-    return model
+    tokenizer = AutoTokenizer.from_pretrained("facebook/opt-350m")
+    return model, tokenizer
 
+def get_available_models():
+    return model_cards.keys()
 
 AVAILABLE_MAP = {
     "facebook/opt-125m": "https://huggingface.co/facebook/opt-125m/blob/main/config.json",
@@ -77,4 +82,8 @@ AVAILABLE_MAP = {
 def load_pretained_model_from_net(repo_name):
     assert repo_name in AVAILABLE_MAP, f"model {repo_name} not available in repo"
     model = OPTForCausalLM.from_pretrained(repo_name)
-    return model
+    tokenizer = AutoTokenizer.from_pretrained(repo_name)
+    return model, tokenizer
+
+def get_available_pretained_models():
+    return AVAILABLE_MAP.keys()

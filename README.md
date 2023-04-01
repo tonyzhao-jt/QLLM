@@ -13,8 +13,8 @@ I refer to many existing LLM implementation provided by ad-hoc researchers, whic
 | proj_name | model | repo_link |
 |-----------|-------|-----------|
 | SmoothQuant | OPT175B | https://github.com/mit-han-lab/smoothquant |
-| GPTQ-For-LLaMa | LLaMa | https://github.com/qwopqwop200/GPTQ-for-LLaMa |
-| Project C | Transformer | https://github.com/user/project-c |
+| GPTQ | LLaMa | https://github.com/IST-DASLab/gptq |
+| Bloom | Bloom | huggingface-bloom |
 
 # PS
 This repo is built to power the project QPipe. Please Cite the paper if you find the repo is useful to you.

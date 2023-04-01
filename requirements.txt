@@ -1,2 +1,6 @@
-git+https://github.com/huggingface/transformers
+# this bug sources from decapo has wrong tokenizer name, repair it later when ok?
+git+https://github.com/zphang/transformers.git@68d640f7c368bcaaaecfc678f11908ebbd3d6176
 accelerate
+jupyter
+sentencepiece
+datasets
