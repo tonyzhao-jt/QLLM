@@ -19,19 +19,141 @@ from transformers.models.opt.modeling_opt import (
 # output decorator
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
-    CausalLMOutputWithPast
+    CausalLMOutputWithPast,
+    ModelOutput
 )
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers.utils import logging
+from transformers.activations import ACT2FN
 logger = logging.get_logger(__name__)
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import random
 
+
+class OPTDecoderLayerSharded(nn.Module):
+    def __init__(self, config: OPTConfig):
+        super().__init__()
+        self.embed_dim = config.hidden_size
+        self.self_attn = OPTAttention(
+            embed_dim=self.embed_dim,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            is_decoder=True,
+            bias=config.enable_bias,
+        )
+        self.do_layer_norm_before = config.do_layer_norm_before
+        self.dropout = config.dropout
+        self.activation_fn = ACT2FN[config.activation_function]
+
+        self.self_attn_layer_norm = nn.LayerNorm(
+            self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
+        )
+        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
+        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+        self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
+
+        self.partitions = [0,1] # by default, contain both self attention and FFN
+
+    def set_partition(self, partitions):
+        self.partitions = partitions
+    
+    def FFN_PART(self, hidden_states, use_cache=False):
+        if use_cache:
+            hidden_states, present_key_value = hidden_states
+        # Fully Connected
+        hidden_states_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+        residual = hidden_states
+
+        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+        if self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+
+        hidden_states = (residual + hidden_states).view(hidden_states_shape)
+
+        # 350m applies layer norm AFTER attention
+        if not self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
+        outputs = (hidden_states,)
+
+        if use_cache:
+            outputs += (present_key_value,)
+        
+        return outputs
+
+    def SELFATTEN_PART(self, hidden_states, attention_mask, past_key_value, layer_head_mask, output_attentions=False):
+        residual = hidden_states
+        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+        if self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+
+        # 350m applies layer norm AFTER attention
+        if not self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+        return hidden_states, present_key_value
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
+        use_cache: Optional[bool] = False,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`, *optional*): attention mask of size
+                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+            layer_head_mask (`torch.FloatTensor`, *optional*): mask for attention heads in a given layer of size
+                `(encoder_attention_heads,)`.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+            use_cache (`bool`, *optional*):
+                If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
+                (see `past_key_values`).
+            past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
+        """
+        if 0 in self.partitions:
+            hidden_states = self.SELFATTEN_PART(hidden_states, attention_mask, past_key_value, layer_head_mask, output_attentions=output_attentions)
+        # Fully Connected
+        if 1 in self.partitions:
+            outputs = self.FFN_PART(hidden_states, use_cache=use_cache)
+        if 0 in self.partitions and 1 in self.partitions:
+            return outputs
+        if 0 in self.partitions:
+            return hidden_states
+        if 1 in self.partitions:
+            return outputs
+        raise ValueError("No partition is specified")
+
 class OPTDecoderSeq(OPTDecoder):
     def __init__(self, config: OPTConfig):
         super().__init__(config)
+        self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
     
     def forward_pre(self, 
         input_ids: torch.LongTensor = None,
