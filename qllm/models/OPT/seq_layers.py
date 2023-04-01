@@ -30,6 +30,7 @@ logger = logging.get_logger(__name__)
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import random
+from dataclasses import dataclass
 
 
 class OPTDecoderLayerSharded(nn.Module):
@@ -57,7 +58,18 @@ class OPTDecoderLayerSharded(nn.Module):
         self.partitions = [0,1] # by default, contain both self attention and FFN
 
     def set_partition(self, partitions):
-        self.partitions = partitions
+        self.partitions = [i for i in partitions]
+    
+    def is_only_self_attention(self):
+        return self.partitions == [0]
+    
+
+    def shard(self, shard_strategy):
+        shard = shard_strategy['shard']
+        bits = shard_strategy['bits']
+        assert len(shard) == len(bits), "shard and bitwidths should have the same length"
+        self.set_partition(shard)
+        # DO quantization and remove the unsed parameters here
     
     def FFN_PART(self, hidden_states, use_cache=False):
         if use_cache:
@@ -139,14 +151,14 @@ class OPTDecoderLayerSharded(nn.Module):
         """
         if 0 in self.partitions:
             hidden_states = self.SELFATTEN_PART(hidden_states, attention_mask, past_key_value, layer_head_mask, output_attentions=output_attentions)
+            if 1 in self.partitions:
+                outputs = self.FFN_PART(hidden_states, use_cache=use_cache)
+                return outputs
+            else:
+                return hidden_states
         # Fully Connected
         if 1 in self.partitions:
             outputs = self.FFN_PART(hidden_states, use_cache=use_cache)
-        if 0 in self.partitions and 1 in self.partitions:
-            return outputs
-        if 0 in self.partitions:
-            return hidden_states
-        if 1 in self.partitions:
             return outputs
         raise ValueError("No partition is specified")
 
@@ -250,18 +262,15 @@ class OPTDecoderSeq(OPTDecoder):
     def get_decoder_layer_num(self):
         return len(self.layers)
 
-    def shard_decoders(self,
-                       start_idx: int=0,
-                       end_idx: int=0):
-        if end_idx == 0:
-            end_idx = self.get_decoder_layer_num()
-        # make sure the start_idx and end_idx are valid
-        assert start_idx >= 0 and start_idx < end_idx and end_idx <= self.get_decoder_layer_num()
-        # make all other layers to be None
+    def shard_decoders(self, sharding_strategy):
+        layer_idxs = list(sharding_strategy.keys())
         for i in range(self.get_decoder_layer_num()):
-            if i < start_idx or i >= end_idx:
+            if i not in layer_idxs:
                 self.layers[i] = None
-    
+        # for each layer, start sharding
+        for layer_idx in layer_idxs:
+            self.layers[layer_idx].shard(sharding_strategy[layer_idx])
+
     # only remains inference related part
     def forward(
         self,
@@ -286,6 +295,9 @@ class OPTDecoderSeq(OPTDecoder):
                 output_attentions=False,
                 use_cache=use_cache,
             )
+            if decoder_layer.is_only_self_attention():
+                return layer_outputs + (next_decoder_cache,) # contains hidden_states and present_key_value
+                                     # but is till ok to pass to next decoder layer
 
             hidden_states = layer_outputs[0]
 
@@ -413,31 +425,76 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         # # decoder layer number
         # decoder_num = self.model.decoder.get_decoder_layer_num()
 
+        # SUM, 12
+        shard_1_strategy = {
+            0: {'shard': [0, 1], 'bits': [8, 8]},
+            1: {'shard': [0, 1], 'bits': [8, 8]},
+            2: {'shard': [0, 1], 'bits': [8, 8]},
+            3: {'shard': [0, 1], 'bits': [8, 8]},
+            4: {'shard': [0, 1], 'bits': [8, 8]},
+            5: {'shard': [0, 1], 'bits': [8, 8]},
+            6: {'shard': [0], 'bits': [8]},
+        }
+
+        shard_2_strategy = {
+            6: {'shard': [1], 'bits': [8]},
+            7: {'shard': [0,1], 'bits': [8, 8]},
+            8: {'shard': [0,1], 'bits': [8, 8]},
+            9: {'shard': [0,1], 'bits': [8, 8]},
+            10: {'shard': [0,1], 'bits': [8, 8]},
+            11: {'shard': [0,1], 'bits': [8, 8]},
+        }
+
+        def shard_launcher(prev_result, module_shard):
+            length_prev_result = len(prev_result)
+            if length_prev_result == 3: # ATTN
+                return module_shard(
+                    hidden_states=prev_result[:2],
+                    next_decoder_cache=prev_result[2],
+                    head_mask=head_mask,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
+            else:
+                return module_shard(
+                    hidden_states=prev_result[0],
+                    next_decoder_cache=prev_result[1],
+                    head_mask=head_mask,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                )
         
         import copy
         decoder_1 = copy.deepcopy(self.model.decoder)
         decoder_2 = copy.deepcopy(self.model.decoder)
 
-        decoder_1.shard_decoders(0, 5)
-        decoder_2.shard_decoders(5)
-    
-        result = decoder_1(
-            hidden_states=pre_result['hidden_states'],
-            next_decoder_cache=pre_result['next_decoder_cache'],
-            head_mask=head_mask,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-        )
+        decoder_1.shard_decoders(shard_1_strategy)
+        decoder_2.shard_decoders(shard_2_strategy)
 
-        result = decoder_2(
-            hidden_states=result[0],
-            next_decoder_cache=result[1],
-            head_mask=head_mask,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-        )
+        pre_result = (pre_result['hidden_states'],pre_result['next_decoder_cache'])
+        pre_result = shard_launcher(pre_result, decoder_1)
+        pre_result = shard_launcher(pre_result, decoder_2)
+        result = pre_result
+
+        # result = decoder_1(
+        #     hidden_states=pre_result['hidden_states'],
+        #     next_decoder_cache=pre_result['next_decoder_cache'],
+        #     head_mask=head_mask,
+        #     attention_mask=attention_mask,
+        #     past_key_values=past_key_values,
+        #     use_cache=use_cache,
+        # )
+
+        # result = decoder_2(
+        #     hidden_states=result[:2],
+        #     next_decoder_cache=result[2],
+        #     head_mask=head_mask,
+        #     attention_mask=attention_mask,
+        #     past_key_values=past_key_values,
+        #     use_cache=use_cache,
+        # )
 
         after_result = self.model.decoder.forward_post(
             *result, use_cache=use_cache, return_dict=return_dict
