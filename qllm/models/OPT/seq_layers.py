@@ -33,6 +33,9 @@ import random
 from dataclasses import dataclass
 import copy
 
+import lptorch
+from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module
+
 
 class OPTDecoderLayerSharded(nn.Module):
     def __init__(self, config: OPTConfig):
@@ -78,13 +81,14 @@ class OPTDecoderLayerSharded(nn.Module):
             self.fc2 = None
             self.final_layer_norm = None
         
+        caliber = lptorch.inner_caliber
         # Do Quantization Here
-        # for idx, partition in enumerate(self.partitions):
-        #     if partition == 0:
-        #         self.self_attn.shard(bits[idx])
-        #     elif partition == 1:
-        #         self.fc1.shard(bits[idx])
-        #         self.fc2.shard(bits[idx])
+        for idx, partition in enumerate(self.partitions):
+            if partition == 0:
+                quantize_linear_module_with_bit(self.self_attn, bits[idx], caliber=caliber)
+            elif partition == 1:
+                self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bits[idx], caliber=caliber)
+                self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bits[idx], caliber=caliber)
     
     def FFN_PART(self, hidden_states, use_cache=False):
         if use_cache:
@@ -283,14 +287,24 @@ class OPTDecoderSeq(OPTDecoder):
     def get_decoder_layer_num(self):
         return len(self.layers)
 
-    def shard_decoders(self, sharding_strategy):
+    # inplace sharding
+    def _shard_decoders(self, sharding_strategy):
         layer_idxs = list(sharding_strategy.keys())
         for i in range(self.get_decoder_layer_num()):
             if i not in layer_idxs:
+                del_ele = self.layers[i]
                 self.layers[i] = None
+                del del_ele
         # for each layer, start sharding
         for layer_idx in layer_idxs:
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
+    
+    def _delete_all_other_modules(self):
+        del self.embed_tokens
+        del self.embed_positions
+        del self.final_layer_norm
+        del self.project_in
+        del self.project_out
 
     # only remains inference related part
     def forward(
@@ -420,10 +434,8 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
         return pre_result
     
-    # hidden_states = self.decoder.embed_tokens(input_ids)
-    # pos_embeds = self.decoder.embed_positions(attention_mask)
-    # hidden_states = hidden_states + pos_embeds
-    def shard_model(self, shard_strategies, shard_idx):
+    # inplace sharding
+    def _shard_model(self, shard_strategies, shard_idx):
         self.is_master = True if shard_idx == 0 else False
         if self.is_master:
             all_decode_ids = set()
@@ -432,7 +444,19 @@ class OPTForCausalLMSeq(OPTForCausalLM):
                 all_decode_ids = all_decode_ids.union(decode_ids)
             assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
         current_shard_strategy = shard_strategies[shard_idx]
-        self.model.decoder.shard_decoders(current_shard_strategy)
+        self.model.decoder._shard_decoders(current_shard_strategy)
+        if not self.is_master:
+            self.model.decoder._delete_all_other_modules()
+
+    # return model instance with copy
+    def shard_model(self, shard_strategies, shard_idx):
+        # copy a model
+        sharded_model = copy.deepcopy(self)
+        sharded_model._shard_model(shard_strategies, shard_idx)
+        return sharded_model
+    
+    def decoder_layers_to_device(self, device):
+        self.model.decoder.layers = self.model.decoder.layers.to(device)
 
     # rewrite the forward function
     def decode(self, pre_result):
@@ -512,6 +536,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
 if __name__ == '__main__':
     from qllm.models import opt 
+    from qllm.utils import get_model_size
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
@@ -540,9 +565,14 @@ if __name__ == '__main__':
             11: {'shard': [0,1], 'bits': [8, 8]},
         }
     }
-    model.shard_model(sharding_strategy, 0)
-    model_2.shard_model(sharding_strategy, 1)
-    model_3.shard_model(sharding_strategy, 2)
+    model._shard_model(sharding_strategy, 0)
+    model_2._shard_model(sharding_strategy, 1)
+    model_3._shard_model(sharding_strategy, 2)
+
+    # print model 1, 2, 3 size in MB
+    print("Model 1 size: ", get_model_size(model, 'MB'))
+    print("Model 2 size: ", get_model_size(model_2, 'MB'))
+    print("Model 3 size: ", get_model_size(model_3, 'MB'))
 
     with torch.no_grad():
         res_2 = opt_125M(input_ids)
