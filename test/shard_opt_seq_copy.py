@@ -2,16 +2,17 @@
 from qllm.models import opt 
 from qllm.utils import get_model_size_cuda, list_tensors_on_cuda
 from qllm.utils import (
+    check_model_weights_dtype,
     to_device_recursive, to_device_recursive_except, 
     to_dtype_recursive, to_dtype_recursive_except, to_dtype_except_linear_layer, to_half_for_modules
 )
 from qllm.models.OPT import OPTForCausalLMSeq
 import torch
 if __name__ == '__main__':
-    opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
+    opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-350m')
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
-    weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m")
+    weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-350m", torch_dtype=torch.float16)
     # sharding_strategy = {
     #     0: {
     #         0: {'shard': [0, 1], 'bits': [8, 8]},
@@ -33,29 +34,41 @@ if __name__ == '__main__':
     #         11: {'shard': [0,1], 'bits': [8, 8]},
     #     }
     # }
-
+    print("decoder layernum", weight_loaded_model.model.decoder.get_decoder_layer_num())
     sharding_strategy = {
         0: {
+        },
+        1: {
             0: {'shard': [0, 1], 'bits': [16, 16]},
             1: {'shard': [0, 1], 'bits': [16, 16]},
             2: {'shard': [0, 1], 'bits': [16, 16]},
             3: {'shard': [0, 1], 'bits': [16, 16]},
             4: {'shard': [0, 1], 'bits': [16, 16]},
-            5: {'shard': [0, 1], 'bits': [16, 16]},
-            6: {'shard': [0], 'bits': [16]},
-        },
-        1: {
-            6: {'shard': [1], 'bits': [16]},
-            7: {'shard': [0,1], 'bits': [16, 16]},
-            8: {'shard': [0,1], 'bits': [16, 16]},
+            5: {'shard': [0, 1], 'bits': [16, 8]},
+            6: {'shard': [0, 1], 'bits': [16, 16]},
+            7: {'shard': [0, 1], 'bits': [16, 16]},
+            8: {'shard': [0], 'bits': [16]},
         },
         2: {
+            8: {'shard': [1], 'bits': [16]},
             9: {'shard': [0,1], 'bits': [16, 16]},
-            10: {'shard': [0,1], 'bits': [16, 16]},
+            10: {'shard': [0,1], 'bits': [8, 16]},
             11: {'shard': [0,1], 'bits': [16, 16]},
+            # 350M
+            12: {'shard': [0,1], 'bits': [16, 16]},
+            13: {'shard': [0,1], 'bits': [16, 16]},
+            14: {'shard': [0,1], 'bits': [8, 16]},
+            15: {'shard': [0,1], 'bits': [16, 16]},
+            16: {'shard': [0,1], 'bits': [16, 16]},
+            17: {'shard': [0,1], 'bits': [16, 8]},
+            18: {'shard': [0,1], 'bits': [16, 16]},
+            19: {'shard': [0,1], 'bits': [16, 16]},
+            20: {'shard': [0,1], 'bits': [8, 16]},
+            21: {'shard': [0,1], 'bits': [16, 16]},
+            22: {'shard': [0,1], 'bits': [16, 16]}, 
+            23: {'shard': [0,1], 'bits': [16, 16]},
         }
     }
-    to_half_for_modules(weight_loaded_model)
     model_2 = weight_loaded_model.shard_model(sharding_strategy, 1)
     model_3 = weight_loaded_model.shard_model(sharding_strategy, 2)
     model = weight_loaded_model
@@ -67,14 +80,14 @@ if __name__ == '__main__':
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
     opt_125M = opt_125M.cuda()
-    opt_125M.half()
+    # becareful to use this one
     input_ids = input_ids.cuda()
 
     # eval mode
-    model.eval()
-    model_2.eval()
-    model_3.eval()
-    opt_125M.eval()
+    # model.eval()
+    # model_2.eval()
+    # model_3.eval()
+    # opt_125M.eval()
 
     # print model 1, 2, 3 size in MB
     print("Original Model Size:", get_model_size_cuda(opt_125M.model, 'MB'))

@@ -79,9 +79,9 @@ AVAILABLE_MAP = {
     "facebook/opt-13b": "https://huggingface.co/facebook/opt-13b/blob/main/config.json",
 }
 
-def load_pretained_model_from_net(repo_name):
+def load_pretained_model_from_net(repo_name, dtype=torch.float16):
     assert repo_name in AVAILABLE_MAP, f"model {repo_name} not available in repo"
-    model = OPTForCausalLM.from_pretrained(repo_name)
+    model = OPTForCausalLM.from_pretrained(repo_name, torch_dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(repo_name)
     return model, tokenizer
 
