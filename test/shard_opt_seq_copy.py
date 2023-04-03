@@ -12,25 +12,47 @@ if __name__ == '__main__':
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m")
+    # sharding_strategy = {
+    #     0: {
+    #         0: {'shard': [0, 1], 'bits': [8, 8]},
+    #         1: {'shard': [0, 1], 'bits': [8, 8]},
+    #         2: {'shard': [0, 1], 'bits': [8, 8]},
+    #         3: {'shard': [0, 1], 'bits': [8, 8]},
+    #         4: {'shard': [0, 1], 'bits': [8, 8]},
+    #         5: {'shard': [0, 1], 'bits': [8, 8]},
+    #         6: {'shard': [0], 'bits': [8]},
+    #     },
+    #     1: {
+    #         6: {'shard': [1], 'bits': [8]},
+    #         7: {'shard': [0,1], 'bits': [8, 8]},
+    #         8: {'shard': [0,1], 'bits': [8, 8]},
+    #     },
+    #     2: {
+    #         9: {'shard': [0,1], 'bits': [8, 8]},
+    #         10: {'shard': [0,1], 'bits': [8, 8]},
+    #         11: {'shard': [0,1], 'bits': [8, 8]},
+    #     }
+    # }
+
     sharding_strategy = {
         0: {
-            0: {'shard': [0, 1], 'bits': [8, 8]},
-            1: {'shard': [0, 1], 'bits': [8, 8]},
-            2: {'shard': [0, 1], 'bits': [8, 8]},
-            3: {'shard': [0, 1], 'bits': [8, 8]},
-            4: {'shard': [0, 1], 'bits': [8, 8]},
-            5: {'shard': [0, 1], 'bits': [8, 8]},
-            6: {'shard': [0], 'bits': [8]},
+            0: {'shard': [0, 1], 'bits': [16, 16]},
+            1: {'shard': [0, 1], 'bits': [16, 16]},
+            2: {'shard': [0, 1], 'bits': [16, 16]},
+            3: {'shard': [0, 1], 'bits': [16, 16]},
+            4: {'shard': [0, 1], 'bits': [16, 16]},
+            5: {'shard': [0, 1], 'bits': [16, 16]},
+            6: {'shard': [0], 'bits': [16]},
         },
         1: {
-            6: {'shard': [1], 'bits': [8]},
-            7: {'shard': [0,1], 'bits': [8, 8]},
-            8: {'shard': [0,1], 'bits': [8, 8]},
+            6: {'shard': [1], 'bits': [16]},
+            7: {'shard': [0,1], 'bits': [16, 16]},
+            8: {'shard': [0,1], 'bits': [16, 16]},
         },
         2: {
-            9: {'shard': [0,1], 'bits': [8, 8]},
-            10: {'shard': [0,1], 'bits': [8, 8]},
-            11: {'shard': [0,1], 'bits': [8, 8]},
+            9: {'shard': [0,1], 'bits': [16, 16]},
+            10: {'shard': [0,1], 'bits': [16, 16]},
+            11: {'shard': [0,1], 'bits': [16, 16]},
         }
     }
     to_half_for_modules(weight_loaded_model)
@@ -45,12 +67,19 @@ if __name__ == '__main__':
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
     opt_125M = opt_125M.cuda()
+    opt_125M.half()
     input_ids = input_ids.cuda()
 
+    # eval mode
+    model.eval()
+    model_2.eval()
+    model_3.eval()
+    opt_125M.eval()
+
     # print model 1, 2, 3 size in MB
-    print("Original Model Size:", get_model_size_cuda(weight_loaded_model.model.decoder, 'MB'))
+    print("Original Model Size:", get_model_size_cuda(opt_125M.model, 'MB'))
     # print model 1, 2, 3 size in MB
-    print("Model 1 size: ", get_model_size_cuda(model.model.decoder, 'MB'))
+    print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
 
