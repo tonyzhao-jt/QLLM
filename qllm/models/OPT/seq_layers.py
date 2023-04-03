@@ -434,19 +434,27 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
         return pre_result
     
+    def _verify_shard_strategy(self, shard_strategies):
+        all_decode_ids = set()
+        for idx, shard_strategy in shard_strategies.items():
+            decode_ids = shard_strategy.keys()
+            all_decode_ids = all_decode_ids.union(decode_ids)
+        assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
+        return True
+    
+    def _shard_model_current(self, shard_strategy, is_master=False):
+        self.model.decoder._shard_decoders(shard_strategy)
+        if is_master:
+            self.model.decoder._delete_all_other_modules()
+
     # inplace sharding
     def _shard_model(self, shard_strategies, shard_idx):
         self.is_master = True if shard_idx == 0 else False
         if self.is_master:
-            all_decode_ids = set()
-            for idx, shard_strategy in shard_strategies.items():
-                decode_ids = shard_strategy.keys()
-                all_decode_ids = all_decode_ids.union(decode_ids)
-            assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
+            self._verify_shard_strategy(shard_strategies)
         current_shard_strategy = shard_strategies[shard_idx]
-        self.model.decoder._shard_decoders(current_shard_strategy)
-        if not self.is_master:
-            self.model.decoder._delete_all_other_modules()
+        self._shard_model_current(current_shard_strategy)
+        
 
     # return model instance with copy
     def shard_model(self, shard_strategies, shard_idx):
