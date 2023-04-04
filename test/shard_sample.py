@@ -7,6 +7,7 @@ from qllm.utils import (
     to_dtype_recursive, to_dtype_recursive_except, to_dtype_except_linear_layer, to_half_for_modules
 )
 from qllm.models.OPT import OPTForCausalLMSeq
+import lptorch
 import torch
 if __name__ == '__main__':
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-350m')
@@ -68,7 +69,13 @@ if __name__ == '__main__':
             22: {'shard': [0,1], 'bits': [16, 16]}, 
             23: {'shard': [0,1], 'bits': [16, 16]},
         }
-    }
+    }    
+    
+    # set calib results
+    caliber = lptorch.inner_caliber
+    caliber.set_model(weight_loaded_model)
+    caliber.load_calib_data('./opt_350M_calib_data.pkl')
+
     model_pre_and_post = weight_loaded_model._pure_pre_and_post()
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
     model_2 = weight_loaded_model.shard_model(sharding_strategy, 1)

@@ -34,14 +34,354 @@ from dataclasses import dataclass
 import copy
 
 import lptorch
-from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module
+from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
+from lptorch.utils import is_tensorcore_int8_available
 
+
+from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+from lptorch.torch_int.nn.fused import LayerNormQ
+class Int8OPTAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {num_heads})."
+            )
+
+        self.attention_weight_scale = 1.0
+
+        self.qk_bmm = BMM_S8T_S8N_F32T(1.0)
+        self.pv_bmm = BMM_S8T_S8N_S8T(1.0)
+
+        self.k_proj = W8A8B8O8Linear(embed_dim, embed_dim)
+        self.v_proj = W8A8B8O8Linear(embed_dim, embed_dim)
+        self.q_proj = W8A8B8O8Linear(embed_dim, embed_dim)
+        self.out_proj = W8A8BFP32OFP32Linear(embed_dim, embed_dim)
+
+        self.fwd_tokenizer = ForwardTokenizer(16, 8)
+
+    @staticmethod
+    @torch.no_grad()
+    def from_float(module: OPTAttention,
+                   input_scale: float,
+                   q_output_scale: float,
+                   k_output_scale: float,
+                   v_output_scale: float,
+                   out_input_scale: float):
+        int8_module = Int8OPTAttention(module.embed_dim, module.num_heads)
+        # Fuse the scaling into the q_proj output scale
+        q_output_scale = q_output_scale * module.scaling
+        module.q_proj.weight *= module.scaling
+        module.q_proj.bias *= module.scaling
+        int8_module.q_proj = W8A8B8O8Linear.from_float(
+            module.q_proj, input_scale, q_output_scale)
+        int8_module.k_proj = W8A8B8O8Linear.from_float(
+            module.k_proj, input_scale, k_output_scale)
+        int8_module.v_proj = W8A8B8O8Linear.from_float(
+            module.v_proj, input_scale, v_output_scale)
+        int8_module.out_proj = W8A8BFP32OFP32Linear.from_float(
+            module.out_proj, out_input_scale)
+        int8_module.qk_bmm = BMM_S8T_S8N_F32T.from_scale(
+            q_output_scale, k_output_scale)
+
+        # alpha = s_prob * s_v / s_out, where s_prob = 1 / 127
+        int8_module.pv_bmm = BMM_S8T_S8N_S8T.from_scale(
+            1.0 / 127, v_output_scale, out_input_scale)
+        return int8_module
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    @torch.no_grad()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+        # if key_value_states are provided this layer is used as a cross-attention layer
+        # for the decoder
+        is_cross_attention = key_value_states is not None
+
+        bsz, tgt_len, _ = hidden_states.size()
+        # add a quantizer here
+        # get query proj
+        if hidden_states.dtype != torch.int8:
+            hidden_states = self.fwd_tokenizer(hidden_states)
+        query_states = self.q_proj(hidden_states)
+        # get key, value proj
+        if is_cross_attention and past_key_value is not None:
+            # reuse k,v, cross_attentions
+            key_states = past_key_value[0]
+            value_states = past_key_value[1]
+        elif is_cross_attention:
+            # cross_attentions
+            key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
+            value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
+        elif past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        else:
+            # self_attention
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+        past_key_value = (key_states, value_states)
+
+        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+        query_states = self._shape(
+            query_states, tgt_len, bsz).view(*proj_shape)
+        key_states = key_states.view(*proj_shape)
+        value_states = value_states.view(*proj_shape)
+
+        src_len = key_states.size(1)
+        print(query_states.shape, key_states.shape)
+        print(query_states.dtype, key_states.dtype)
+        attn_weights = self.qk_bmm(query_states, key_states)
+
+        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights.view(
+                bsz, self.num_heads, tgt_len, src_len) + attention_mask
+            attn_weights = torch.max(attn_weights, torch.tensor(
+                torch.finfo(attn_weights.dtype).min))
+            attn_weights = attn_weights.view(
+                bsz * self.num_heads, tgt_len, src_len)
+
+        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                    f" {layer_head_mask.size()}"
+                )
+            attn_probs = layer_head_mask.view(
+                1, -1, 1, 1) * attn_probs.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_probs = attn_probs.view(
+                bsz * self.num_heads, tgt_len, src_len)
+
+        if output_attentions:
+            # this operation is a bit awkward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to be reshaped
+            # twice and have to be reused in the following
+            attn_probs_reshaped = attn_probs.view(
+                bsz, self.num_heads, tgt_len, src_len)
+            attn_probs = attn_probs_reshaped.view(
+                bsz * self.num_heads, tgt_len, src_len)
+        else:
+            attn_probs_reshaped = None
+
+        # (A_row V_row)_row = (A_row V_col ^T)_row
+        attn_probs.mul_(127).round_()
+        attn_probs = attn_probs.to(torch.int8)
+
+        value_states = value_states.transpose(1, 2).contiguous()
+        attn_output = self.pv_bmm(attn_probs, value_states)
+
+        if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.view(
+            bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+
+        # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
+        # partitioned aross GPUs when using tensor-parallelism.
+        attn_output = attn_output.reshape(
+            bsz, tgt_len, self.embed_dim).contiguous()
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_probs_reshaped, past_key_value
+
+class OPTAttentionSeq(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        is_decoder: bool = False,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.head_dim = embed_dim // num_heads
+
+        if (self.head_dim * num_heads) != self.embed_dim:
+            raise ValueError(
+                f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.embed_dim}"
+                f" and `num_heads`: {num_heads})."
+            )
+        self.scaling = self.head_dim**-0.5
+        self.is_decoder = is_decoder
+
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        key_value_states: Optional[torch.Tensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        layer_head_mask: Optional[torch.Tensor] = None,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        """Input shape: Batch x Time x Channel"""
+
+        # if key_value_states are provided this layer is used as a cross-attention layer
+        # for the decoder
+        is_cross_attention = key_value_states is not None
+
+        bsz, tgt_len, _ = hidden_states.size()
+
+        # get query proj
+        query_states = self.q_proj(hidden_states) * self.scaling
+        # get key, value proj
+        if is_cross_attention and past_key_value is not None:
+            # reuse k,v, cross_attentions
+            key_states = past_key_value[0]
+            value_states = past_key_value[1]
+        elif is_cross_attention:
+            # cross_attentions
+            key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
+            value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
+        elif past_key_value is not None:
+            # reuse k, v, self_attention
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+            key_states = torch.cat([past_key_value[0], key_states], dim=2)
+            value_states = torch.cat([past_key_value[1], value_states], dim=2)
+        else:
+            # self_attention
+            key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
+            value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
+
+        if self.is_decoder:
+            # if cross_attention save Tuple(torch.Tensor, torch.Tensor) of all cross attention key/value_states.
+            # Further calls to cross_attention layer can then reuse all cross-attention
+            # key/value_states (first "if" case)
+            # if uni-directional self-attention (decoder) save Tuple(torch.Tensor, torch.Tensor) of
+            # all previous decoder key/value_states. Further calls to uni-directional self-attention
+            # can concat previous decoder key/value_states to current projected key/value_states (third "elif" case)
+            # if encoder bi-directional self-attention `past_key_value` is always `None`
+            past_key_value = (key_states, value_states)
+
+        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+        query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
+        key_states = key_states.view(*proj_shape)
+        value_states = value_states.view(*proj_shape)
+
+        src_len = key_states.size(1)
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+
+        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+            raise ValueError(
+                f"Attention weights should be of size {(bsz * self.num_heads, tgt_len, src_len)}, but is"
+                f" {attn_weights.size()}"
+            )
+
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, tgt_len, src_len)}, but is {attention_mask.size()}"
+                )
+            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len) + attention_mask
+            attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
+        if attn_weights.dtype == torch.float16:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+        else:
+            attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+
+        if layer_head_mask is not None:
+            if layer_head_mask.size() != (self.num_heads,):
+                raise ValueError(
+                    f"Head mask for a single layer should be of size {(self.num_heads,)}, but is"
+                    f" {layer_head_mask.size()}"
+                )
+            attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+        if output_attentions:
+            # this operation is a bit awkward, but it's required to
+            # make sure that attn_weights keeps its gradient.
+            # In order to do so, attn_weights have to be reshaped
+            # twice and have to be reused in the following
+            attn_weights_reshaped = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights_reshaped.view(bsz * self.num_heads, tgt_len, src_len)
+        else:
+            attn_weights_reshaped = None
+
+        attn_probs = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+
+        attn_output = torch.bmm(attn_probs, value_states)
+
+        if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, tgt_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.view(bsz, self.num_heads, tgt_len, self.head_dim)
+        attn_output = attn_output.transpose(1, 2)
+
+        # Use the `embed_dim` from the config (stored in the class) rather than `hidden_state` because `attn_output` can be
+        # partitioned aross GPUs when using tensor-parallelism.
+        attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
+
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_weights_reshaped, past_key_value
 
 class OPTDecoderLayerSharded(nn.Module):
     def __init__(self, config: OPTConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
-        self.self_attn = OPTAttention(
+        self.self_attn = OPTAttentionSeq(
             embed_dim=self.embed_dim,
             num_heads=config.num_attention_heads,
             dropout=config.attention_dropout,
@@ -66,6 +406,38 @@ class OPTDecoderLayerSharded(nn.Module):
     
     def is_only_self_attention(self):
         return self.partitions == [0]
+
+    # FOR CUTLASS (tensorcore), it may not be available to run on all GPUs.
+    # Need to verify whether it is available on the current GPU.
+    def verify_kernel(self):
+        test_result = []
+        for part, input_shape in self.test_input_shape.items():
+            if part == 'self_attn':
+                try:
+                    fake_input = torch.randn(input_shape).cuda().half()
+                    test_attn = self.self_attn.cuda()
+                    fake_output = test_attn(fake_input)
+                    del test_attn, fake_output
+                    test_result.append(True)
+                except Exception as e:
+                    print(e)
+                    test_result.append(False)
+            if part == 'FFN':
+                try:
+                    fake_input = torch.randn(input_shape).cuda().half()
+                    test_fc1 = self.fc1.cuda()
+                    test_ln = self.final_layer_norm.cuda()
+                    test_fc2 = self.fc2.cuda()
+                    # test
+                    fake_output = test_fc1(test_ln(fake_input))
+                    fake_output = test_fc2(fake_output)
+                    del test_fc1, test_ln, test_fc2, fake_output, fake_input
+                    test_result.append(True)
+                except Exception as e:
+                    print(e)
+                    test_result.append(False)        
+        
+        return test_result
     
     def shard(self, shard_strategy):
         self.set_partition(shard_strategy.get('shard', []))
@@ -81,14 +453,80 @@ class OPTDecoderLayerSharded(nn.Module):
             self.fc2 = None
             self.final_layer_norm = None
         
+        self.test_input_shape = {}
         caliber = lptorch.inner_caliber
         # Do Quantization Here
         for idx, partition in enumerate(self.partitions):
             if partition == 0:
-                quantize_linear_module_with_bit(self.self_attn, bits[idx], caliber=caliber)
+                # deal with quantization here.
+                bit = bits[idx]
+                input_shape = caliber.get_module_input_shape(self.self_attn.q_proj)
+                self.test_input_shape['self_attn'] = input_shape
+                if bit == "8:tc": # tensorcore int8
+                    assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attn.q_proj) is not None, \
+                        "Tensorcore is not available on this GPU, or the calibration data is not available"
+                    attn_input_scale, q_output_scale = caliber.get_module_calib_data(self.self_attn.q_proj)
+                    _, k_output_scale = caliber.get_module_calib_data(self.self_attn.k_proj)
+                    _, v_output_scale = caliber.get_module_calib_data(self.self_attn.v_proj)
+                    _, out_input_scale = caliber.get_module_calib_data(self.self_attn.out_proj)
+                    self.self_attn = Int8OPTAttention.from_float(
+                        self.self_attn, attn_input_scale, q_output_scale, k_output_scale, v_output_scale, out_input_scale)
+                # TODO: for moment, we disable the torchint by passing none to caliber
+                elif bit == "8:tc-li":
+                    bit = 8
+                    quantize_linear_module_with_bit(self.self_attn, bit, caliber=caliber)
+                else:   
+                    quantize_linear_module_with_bit(self.self_attn, bit, caliber=None)
+                
             elif partition == 1:
-                self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bits[idx], caliber=caliber)
-                self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bits[idx], caliber=caliber)
+                bit = bits[idx]
+                input_shape = caliber.get_module_input_shape(self.fc1)
+                self.test_input_shape['FFN'] = input_shape
+                if bit == "8:tc":
+                    assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.fc1) is not None, \
+                        "Tensorcore is not available on this GPU, or the calibration data is not available"
+                    fc1_input_scale, fc1_output_scale = caliber.get_module_calib_data(self.fc1)
+                    fc2_input_scale, fc2_output_scale = caliber.get_module_calib_data(self.fc2)
+                    self.final_layer_norm = LayerNormQ.from_float(self.final_layer_norm, fc1_input_scale)
+                    self.fc1 = W8A8B8O8LinearReLU.from_float(
+                    self.fc1, fc1_input_scale, fc2_input_scale)
+                    self.fc2 = W8A8BFP32OFP32Linear.from_float(
+                    self.fc2, fc2_input_scale)
+                elif bit == '8:tc-li':
+                    bit = 8
+                    self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=caliber)
+                    self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=caliber)
+                else:
+                    # logger.info("use non-kernel quantization for f1f2")
+                    # adaptive quantization for BITSANDBYTES and GPTQ
+                    self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=None)
+                    self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=None)
+
+    def SELFATTEN_PART(self, hidden_states, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
+        residual = hidden_states
+        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+        if self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+
+        # Self Attention
+        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            attention_mask=attention_mask,
+            layer_head_mask=layer_head_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        hidden_states = residual + hidden_states
+
+        # 350m applies layer norm AFTER attention
+        if not self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+        if use_cache:
+            outputs = (hidden_states, present_key_value)
+        else:
+            outputs = (hidden_states,)
+        return outputs
     
     def FFN_PART(self, hidden_states, use_cache=False):
         if use_cache:
@@ -123,31 +561,7 @@ class OPTDecoderLayerSharded(nn.Module):
         
         return outputs
 
-    def SELFATTEN_PART(self, hidden_states, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
-        residual = hidden_states
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
-            hidden_states=hidden_states,
-            past_key_value=past_key_value,
-            attention_mask=attention_mask,
-            layer_head_mask=layer_head_mask,
-            output_attentions=output_attentions,
-        )
-        hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
-
-        # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-        if use_cache:
-            outputs = (hidden_states, present_key_value)
-        else:
-            outputs = (hidden_states,)
-        return outputs
+    
 
     def forward(
         self,
@@ -299,6 +713,11 @@ class OPTDecoderSeq(OPTDecoder):
         for layer_idx in layer_idxs:
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
     
+    def verify_decoder_layers(self):
+        for layer in self.layers:
+            if layer is not None:
+               return layer.verify_kernel() # we only need to verify one layer
+
     def _delete_all_other_modules(self):
         del self.embed_tokens
         del self.embed_positions
