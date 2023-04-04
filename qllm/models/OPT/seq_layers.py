@@ -317,6 +317,8 @@ class OPTDecoderSeq(OPTDecoder):
         next_decoder_cache: Optional[List[torch.FloatTensor]] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         
+        mask_and_cache = (attention_mask, head_mask, use_cache, past_key_values)
+        
         for idx, decoder_layer in enumerate(self.layers):
             if decoder_layer is None:
                 continue
@@ -331,7 +333,7 @@ class OPTDecoderSeq(OPTDecoder):
                 use_cache=use_cache,
             )
             if decoder_layer.is_only_self_attention():
-                return layer_outputs + (next_decoder_cache,) # contains hidden_states and present_key_value
+                return layer_outputs + (next_decoder_cache,) + mask_and_cache # contains hidden_states and present_key_value
                                      # but is till ok to pass to next decoder layer
 
             hidden_states = layer_outputs[0]
@@ -339,7 +341,7 @@ class OPTDecoderSeq(OPTDecoder):
             if use_cache:
                 next_decoder_cache += (layer_outputs[1],)
 
-        return (hidden_states, next_decoder_cache)
+        return (hidden_states, next_decoder_cache,) + mask_and_cache
         
 # in generation, actually did nothing with model function. 
 # only to decoder
@@ -400,9 +402,9 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
-    
+
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
-                   use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None):
+                   use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, input_token_uuid=1):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -426,26 +428,24 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         attention_mask = pre_result['attention_mask']
         head_mask = pre_result['head_mask']
         use_cache = use_cache
-        pre_result = (pre_result['hidden_states'],pre_result['next_decoder_cache'])
+        mask_and_cache = (attention_mask, head_mask, use_cache, past_key_values)
+        pre_result = (pre_result['hidden_states'], pre_result['next_decoder_cache']) + mask_and_cache
 
-        self.other_decode_params = (
-            attention_mask, head_mask, past_key_values, use_cache, return_dict
-        )
+        self.return_dict = return_dict
 
         return pre_result
     
+    # model sharders
     def _verify_shard_strategy(self, shard_strategies):
         all_decode_ids = set()
         for idx, shard_strategy in shard_strategies.items():
             decode_ids = shard_strategy.keys()
             all_decode_ids = all_decode_ids.union(decode_ids)
         assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
-        return True
     
-    def _shard_model_current(self, shard_strategy, is_master=False):
+    def _shard_model_current(self, shard_strategy):
         self.model.decoder._shard_decoders(shard_strategy)
-        if is_master:
-            self.model.decoder._delete_all_other_modules()
+        self.model.decoder._delete_all_other_modules()
 
     # inplace sharding
     def _shard_model(self, shard_strategies, shard_idx):
@@ -454,7 +454,11 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             self._verify_shard_strategy(shard_strategies)
         current_shard_strategy = shard_strategies[shard_idx]
         self._shard_model_current(current_shard_strategy)
-        
+    
+    def _pure_pre_and_post(self):
+        sharded_model = copy.deepcopy(self)
+        sharded_model.model.decoder._shard_decoders({}) # didn't delete the embeddings, etc.
+        return sharded_model
 
     # return model instance with copy
     def shard_model(self, shard_strategies, shard_idx):
@@ -468,36 +472,35 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
     # rewrite the forward function
     def decode(self, pre_result):
-        attention_mask, head_mask, past_key_values, use_cache, return_dict = self.other_decode_params
 
         def shard_launcher(prev_result, module_shard):
             length_prev_result = len(prev_result)
-            if length_prev_result == 3: # ATTN
-                return module_shard(
-                    hidden_states=prev_result[:2],
-                    next_decoder_cache=prev_result[2],
-                    head_mask=head_mask,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                )
+            if length_prev_result == 7: # ATTN
+                hidden_states, next_decoder_cache = prev_result[:2], prev_result[2]
+                attention_mask, head_mask, use_cache, past_key_values = prev_result[3:]
             else:
-                return module_shard(
-                    hidden_states=prev_result[0],
-                    next_decoder_cache=prev_result[1],
-                    head_mask=head_mask,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                )
+                hidden_states, next_decoder_cache = prev_result[0], prev_result[1]
+                attention_mask, head_mask, use_cache, past_key_values = prev_result[2:]
+
+            return module_shard(
+                hidden_states=hidden_states,
+                next_decoder_cache=next_decoder_cache,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+            )
 
         return shard_launcher(pre_result, self.model.decoder)
 
 
     def postprocess(self, results, labels=None):
-        attention_mask, head_mask, past_key_values, use_cache, return_dict = self.other_decode_params
+        # head_mask, attention_mask should be passed with the pre_result
+        # past_key_value should be stored within the model
+        return_dict = self.return_dict
+        hidden_states, next_decoder_cache, attention_mask, head_mask, use_cache, past_key_values = results
         outputs = self.model.decoder.forward_post(
-            *results, use_cache=use_cache, return_dict=return_dict
+            hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict
         )
         logits = self.lm_head(outputs[0]).contiguous()
         loss = None

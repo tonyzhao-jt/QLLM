@@ -44,7 +44,7 @@ if __name__ == '__main__':
             2: {'shard': [0, 1], 'bits': [16, 16]},
             3: {'shard': [0, 1], 'bits': [16, 16]},
             4: {'shard': [0, 1], 'bits': [16, 16]},
-            5: {'shard': [0, 1], 'bits': [16, 8]},
+            5: {'shard': [0, 1], 'bits': [16, 16]},
             6: {'shard': [0, 1], 'bits': [16, 16]},
             7: {'shard': [0, 1], 'bits': [16, 16]},
             8: {'shard': [0], 'bits': [16]},
@@ -52,31 +52,32 @@ if __name__ == '__main__':
         2: {
             8: {'shard': [1], 'bits': [16]},
             9: {'shard': [0,1], 'bits': [16, 16]},
-            10: {'shard': [0,1], 'bits': [8, 16]},
+            10: {'shard': [0,1], 'bits': [16, 16]},
             11: {'shard': [0,1], 'bits': [16, 16]},
             # 350M
             12: {'shard': [0,1], 'bits': [16, 16]},
             13: {'shard': [0,1], 'bits': [16, 16]},
-            14: {'shard': [0,1], 'bits': [8, 16]},
+            14: {'shard': [0,1], 'bits': [16, 16]},
             15: {'shard': [0,1], 'bits': [16, 16]},
             16: {'shard': [0,1], 'bits': [16, 16]},
-            17: {'shard': [0,1], 'bits': [16, 8]},
+            17: {'shard': [0,1], 'bits': [16, 16]},
             18: {'shard': [0,1], 'bits': [16, 16]},
             19: {'shard': [0,1], 'bits': [16, 16]},
-            20: {'shard': [0,1], 'bits': [8, 16]},
+            20: {'shard': [0,1], 'bits': [16, 16]},
             21: {'shard': [0,1], 'bits': [16, 16]},
             22: {'shard': [0,1], 'bits': [16, 16]}, 
             23: {'shard': [0,1], 'bits': [16, 16]},
         }
     }
+    model_pre_and_post = weight_loaded_model._pure_pre_and_post()
+    model = weight_loaded_model.shard_model(sharding_strategy, 0)
     model_2 = weight_loaded_model.shard_model(sharding_strategy, 1)
     model_3 = weight_loaded_model.shard_model(sharding_strategy, 2)
-    model = weight_loaded_model
-    model._shard_model(sharding_strategy, 0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = model.cuda()
+    model_pre_and_post.cuda()
+    model.decoder_layers_to_device(device)
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
     opt_125M = opt_125M.cuda()
@@ -101,21 +102,10 @@ if __name__ == '__main__':
 
     # this part is communication in distributed serving
     with torch.no_grad():
-        pre_result = model.preprocess(input_ids, use_cache=True)
-        # simulate the broadcast operation
-        model_2.other_decode_params = model.other_decode_params
-        model_3.other_decode_params = model.other_decode_params
-
-        model_2.other_decode_params = to_device_recursive(model_2.other_decode_params, device)
-        model_2.other_decode_params = to_dtype_recursive(model_2.other_decode_params, torch.float16)
-
-        model_3.other_decode_params = to_device_recursive(model_3.other_decode_params, device)
-        model_3.other_decode_params = to_dtype_recursive(model_3.other_decode_params, torch.float16)
-
-    with torch.no_grad():
+        pre_result = model_pre_and_post.preprocess(input_ids, use_cache=True)
         intermediate_results = model.decode(pre_result)
         intermediate_results = model_2.decode(intermediate_results)
         intermediate_results = model_3.decode(intermediate_results)
-        res_1 = model.postprocess(intermediate_results, None)
+        res_1 = model_pre_and_post.postprocess(intermediate_results, None)
 
     print(torch.max(res_1.logits - res_2.logits))
