@@ -14,11 +14,7 @@ import torch
 if __name__ == '__main__':
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
-    input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
-    # test batch inference
-    # batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog", "what is others"], padding=True, return_tensors="pt")
-    # opt_125M.float()
-    # opt_125M(**batched_ids)
+    batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog", "what is others"], padding=True, return_tensors="pt")
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m", torch_dtype=torch.float16)
     sharding_strategy = {
         0: {
@@ -95,8 +91,7 @@ if __name__ == '__main__':
     model_3.decoder_layers_to_device(device)
     opt_125M = opt_125M.cuda()
     # becareful to use this one
-    input_ids = input_ids.cuda()
-
+    batched_ids = to_device_recursive(dict(batched_ids), device)
     # eval mode
     # model.eval()
     # model_2.eval()
@@ -111,23 +106,22 @@ if __name__ == '__main__':
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
 
     with torch.no_grad():
-        res_2 = opt_125M(input_ids)
+        res_2 = opt_125M(**batched_ids)
 
     # this part is communication in distributed serving
     with torch.no_grad():
-        pre_result = model_pre_and_post.preprocess(input_ids, use_cache=True)
+        pre_result = model_pre_and_post.preprocess(**batched_ids, use_cache=True)
         intermediate_results = model.decode(pre_result)
         intermediate_results = model_2.decode(intermediate_results)
         intermediate_results = model_3.decode(intermediate_results)
         res_1 = model_pre_and_post.postprocess(intermediate_results, None)
-
+    
     print(torch.max(res_1.logits - res_2.logits))
-
     # h1 = opt_125M.config.hidden_size
     # h2 = opt_125M.decoders.layers[0].fc2.weight.shape[0]
     h2, h1 = opt_125M.model.decoder.layers[0].fc1.weight.shape
     b = 1
-    s = input_ids.shape[1]
+    s = batched_ids['input_ids'].shape[1]
     n = 1
 
     print(h1, h2)

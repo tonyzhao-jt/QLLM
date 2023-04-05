@@ -7,8 +7,10 @@ def to_device_recursive(obj, device):
         new_obj = [to_device_recursive(item, device) for item in obj]
         return type(obj)(new_obj)
     elif isinstance(obj, dict):
-        new_obj = {k: to_device_recursive(v, device) for k, v in obj.items()}
-        return new_obj
+        new_dict = {}
+        for k, v in obj.items():
+            new_dict[k] = to_device_recursive(v, device)
+        return new_dict
     else:
         return obj
 
