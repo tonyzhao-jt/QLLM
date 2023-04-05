@@ -407,6 +407,9 @@ class OPTDecoderLayerSharded(nn.Module):
     def is_only_self_attention(self):
         return self.partitions == [0]
 
+    def has_self_attention(self):
+        return 0 in self.partitions
+
     # FOR CUTLASS (tensorcore), it may not be available to run on all GPUs.
     # Need to verify whether it is available on the current GPU.
     def verify_kernel(self):
@@ -502,7 +505,7 @@ class OPTDecoderLayerSharded(nn.Module):
                     self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=None)
                     self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=None)
 
-    def SELFATTEN_PART(self, hidden_states, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
+    def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
         residual = hidden_states
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
         if self.do_layer_norm_before:
@@ -522,17 +525,17 @@ class OPTDecoderLayerSharded(nn.Module):
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
             hidden_states = self.self_attn_layer_norm(hidden_states)
+        
+        # use kv cache
         if use_cache:
-            outputs = (hidden_states, present_key_value)
+            outputs = (hidden_states,) + present_key_value
         else:
             outputs = (hidden_states,)
+
         return outputs
     
-    def FFN_PART(self, hidden_states, use_cache=False):
-        if use_cache:
-            hidden_states, present_key_value = hidden_states
-        else:
-            hidden_states = hidden_states[0]
+    def FFN_PART(self, hidden_states:torch.Tensor):
+        hidden_states = hidden_states 
         # Fully Connected
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
@@ -556,12 +559,7 @@ class OPTDecoderLayerSharded(nn.Module):
 
         outputs = (hidden_states,)
 
-        if use_cache:
-            outputs += (present_key_value,)
-        
         return outputs
-
-    
 
     def forward(
         self,
@@ -590,14 +588,18 @@ class OPTDecoderLayerSharded(nn.Module):
         if 0 in self.partitions:
             hidden_states = self.SELFATTEN_PART(hidden_states, attention_mask, past_key_value, layer_head_mask, \
                                                  output_attentions=output_attentions, use_cache=use_cache)
+            # hidden states here are tuple
             if 1 in self.partitions:
-                outputs = self.FFN_PART(hidden_states, use_cache=use_cache)
-                return outputs
+                if use_cache:
+                    present_key_value = hidden_states[1] # tensor
+                hidden_states = hidden_states[0]
+                outputs = self.FFN_PART(hidden_states)
+                return outputs if not use_cache else outputs + (present_key_value, ) # return tuple
             else:
                 return hidden_states
         # Fully Connected
         if 1 in self.partitions:
-            outputs = self.FFN_PART(hidden_states, use_cache=use_cache)
+            outputs = self.FFN_PART(hidden_states)
             return outputs
         raise ValueError("No partition is specified")
 
@@ -681,7 +683,7 @@ class OPTDecoderSeq(OPTDecoder):
             "next_decoder_cache": next_decoder_cache,
         }
 
-    def forward_post(self, hidden_states, next_decoder_cache, use_cache=False, return_dict=False):
+    def forward_post(self, hidden_states, next_decoder_cache=None, use_cache=False, return_dict=False):
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
 
@@ -724,6 +726,33 @@ class OPTDecoderSeq(OPTDecoder):
         del self.final_layer_norm
         del self.project_in
         del self.project_out
+    
+    def update_kv_cache(self, layer_idx, key_value_pair, request_id):
+        if hasattr(self, 'kv_cache'):
+            self.kv_cache = {}
+        if layer_idx not in self.kv_cache:
+            self.kv_cache[layer_idx] = {}
+        self.kv_cache[layer_idx][request_id] = key_value_pair
+
+    def get_kv_cache(self, layer_idx, request_id):
+        if not hasattr(self, 'kv_cache'):
+            self.kv_cache = {}
+        if layer_idx not in self.kv_cache:
+            return None
+        if request_id not in self.kv_cache[layer_idx]:
+            return None
+        return self.kv_cache[layer_idx][request_id]
+    
+    def verbose_kv_cache(self):
+        print(self.kv_cache)
+    
+    def clear_request_kv_cache(self, request_id=1):
+        for layer_idx in self.kv_cache:
+            if request_id in self.kv_cache[layer_idx]:
+                del self.kv_cache[layer_idx][request_id]
+
+    def clear_all_kv_cache(self):
+        self.kv_cache = {}
 
     # only remains inference related part
     def forward(
@@ -734,15 +763,17 @@ class OPTDecoderSeq(OPTDecoder):
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         use_cache: Optional[bool] = None,
         next_decoder_cache: Optional[List[torch.FloatTensor]] = None,
+        request_id: Optional[int] = 1,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         
-        mask_and_cache = (attention_mask, head_mask, use_cache, past_key_values)
+        mask_and_cache = (attention_mask, head_mask, use_cache) 
         
         for idx, decoder_layer in enumerate(self.layers):
             if decoder_layer is None:
                 continue
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            past_key_value = past_key_values[idx] if past_key_values is not None else None
+            past_key_value = self.get_kv_cache(idx, request_id)
+            # past_key_value = past_key_values[idx] if past_key_values is not None else None
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -751,16 +782,19 @@ class OPTDecoderSeq(OPTDecoder):
                 output_attentions=False,
                 use_cache=use_cache,
             )
-            if decoder_layer.is_only_self_attention():
-                return layer_outputs + (next_decoder_cache,) + mask_and_cache # contains hidden_states and present_key_value
-                                     # but is till ok to pass to next decoder layer
+            if decoder_layer.has_self_attention(): # store the kv together with the selfattn
+                if use_cache:
+                    # the output will contain a present key value
+                    self.update_kv_cache(idx, layer_outputs[1], request_id) # update for further usage
 
+            if decoder_layer.is_only_self_attention():
+                hidden_states = (layer_outputs[0], ) # 
+                return hidden_states + mask_and_cache + (request_id, ) 
+            
+            # has only FFN or FFN + selfattn
             hidden_states = layer_outputs[0]
 
-            if use_cache:
-                next_decoder_cache += (layer_outputs[1],)
-
-        return (hidden_states, next_decoder_cache,) + mask_and_cache
+        return (hidden_states, ) + mask_and_cache + (request_id, )
         
 # in generation, actually did nothing with model function. 
 # only to decoder
@@ -823,7 +857,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         self.post_init()
 
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
-                   use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, input_token_uuid=1):
+                   use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -847,8 +881,8 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         attention_mask = pre_result['attention_mask']
         head_mask = pre_result['head_mask']
         use_cache = use_cache
-        mask_and_cache = (attention_mask, head_mask, use_cache, past_key_values)
-        pre_result = (pre_result['hidden_states'], pre_result['next_decoder_cache']) + mask_and_cache
+        mask_and_cache = (attention_mask, head_mask, use_cache) 
+        pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, )
 
         self.return_dict = return_dict
 
@@ -893,21 +927,18 @@ class OPTForCausalLMSeq(OPTForCausalLM):
     def decode(self, pre_result):
 
         def shard_launcher(prev_result, module_shard):
-            length_prev_result = len(prev_result)
-            if length_prev_result == 7: # ATTN
-                hidden_states, next_decoder_cache = prev_result[:2], prev_result[2]
-                attention_mask, head_mask, use_cache, past_key_values = prev_result[3:]
-            else:
-                hidden_states, next_decoder_cache = prev_result[0], prev_result[1]
-                attention_mask, head_mask, use_cache, past_key_values = prev_result[2:]
+            # length_prev_result = len(prev_result)
+            hidden_states = prev_result[0]
+            attention_mask, head_mask, use_cache, request_id = prev_result[1:]
 
             return module_shard(
                 hidden_states=hidden_states,
-                next_decoder_cache=next_decoder_cache,
+                next_decoder_cache=None,
                 attention_mask=attention_mask,
                 head_mask=head_mask,
-                past_key_values=past_key_values,
+                past_key_values=None,
                 use_cache=use_cache,
+                request_id=request_id,
             )
 
         return shard_launcher(pre_result, self.model.decoder)
@@ -917,7 +948,8 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         # head_mask, attention_mask should be passed with the pre_result
         # past_key_value should be stored within the model
         return_dict = self.return_dict
-        hidden_states, next_decoder_cache, attention_mask, head_mask, use_cache, past_key_values = results
+        hidden_states, attention_mask, head_mask, use_cache, request_id = results
+        next_decoder_cache = None
         outputs = self.model.decoder.forward_post(
             hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict
         )
