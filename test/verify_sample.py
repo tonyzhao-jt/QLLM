@@ -15,20 +15,6 @@ if __name__ == '__main__':
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-350m", torch_dtype=torch.float16)
     print("decoder layernum", weight_loaded_model.model.decoder.get_decoder_layer_num())
-    # sharding_strategy = {
-    #     1: {
-    #         0: {'shard': [0,1], 'bits': ['8:tc', '8:tc']},
-    #     },
-    #     2: {
-    #         1: {'shard': [0,1], 'bits': [8, 8]},
-    #     },
-    #     3: {
-    #         2: {'shard': [0,1], 'bits': [4, 4]},
-    #     },
-    #     4: {
-    #         3: {'shard': [0,1], 'bits': [2, 2]},
-    #     },
-    # }    
 
     def verify_bits(loaded_model, bit):
         tmp_sharding_strategy = {

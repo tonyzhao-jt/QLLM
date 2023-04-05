@@ -5,7 +5,8 @@ from qllm.utils import (
     check_model_weights_dtype,
     to_device_recursive, to_device_recursive_except, 
     to_dtype_recursive, to_dtype_recursive_except, to_dtype_except_linear_layer, to_half_for_modules,
-    get_iter_variable_size
+    get_iter_variable_size,
+    ModelMemEstimator
 )
 from qllm.models.OPT import OPTForCausalLMSeq
 import lptorch
@@ -26,9 +27,9 @@ if __name__ == '__main__':
             6: {'shard': [0], 'bits': [16]},
         },
         1: {
-            6: {'shard': [1], 'bits': [16]},
-            7: {'shard': [0,1], 'bits': [16, 16]},
-            8: {'shard': [0,1], 'bits': [16, 16]},
+            6: {'shard': [1], 'bits': [8]},
+            7: {'shard': [0,1], 'bits': [8, 8]},
+            8: {'shard': [0,1], 'bits': [8, 8]},
         },
         2: {
             9: {'shard': [0,1], 'bits': [16, 16]},
@@ -118,6 +119,15 @@ if __name__ == '__main__':
 
     print(torch.max(res_1.logits - res_2.logits))
 
+    # h1 = opt_125M.config.hidden_size
+    # h2 = opt_125M.decoders.layers[0].fc2.weight.shape[0]
+    h2, h1 = opt_125M.model.decoder.layers[0].fc1.weight.shape
+    b = 1
+    s = input_ids.shape[1]
+    n = 1
+
+    print(h1, h2)
+    model_mem_estimator = ModelMemEstimator(h1, h2, b, s, n)
     # print model 1, 2, 3 size in MB
     print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
@@ -126,5 +136,7 @@ if __name__ == '__main__':
     print("KV Cache Size 1: ", get_iter_variable_size(model.model.decoder.kv_cache, unit='MB'))
     print("KV Cache Size 2: ", get_iter_variable_size(model_2.model.decoder.kv_cache, unit='MB'))
     print("KV Cache Size 3: ", get_iter_variable_size(model_3.model.decoder.kv_cache, unit='MB'))
+    print("Estimated Model2 size", model_mem_estimator.calculate_maximum_mem_occupation_of_partition(sharding_strategy[1], unit='MB'))
+
 
 
