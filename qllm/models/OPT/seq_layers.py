@@ -861,6 +861,25 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+    def preprocess_one_token(self, new_input_ids, next_tokens, request_token):
+        input_ids_seq_length = new_input_ids.shape[1] - 1
+        embed_tokens = self.model.decoder.embed_tokens
+        pos_embeds = self.model.decoder.embed_positions
+        # embed the new input tokens
+
+        inputs_embeds = embed_tokens(new_input_ids)
+        next_token_embeds = embed_tokens(next_tokens)
+        bs = next_token_embeds.size(0)
+        input_shape = (bs, 1)
+        next_token_embeds = next_token_embeds.view(bs, 1, -1)
+        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
+        p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
+        attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
+        # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
+        next_token_embeds = next_token_embeds + p_embeds[-1:]
+        request_token = (next_token_embeds, attention_mask) + request_token[2:]
+        return request_token
+
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
                    use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1, \
                     past_key_values_length: int = 0, **kwargs):

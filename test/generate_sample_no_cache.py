@@ -14,6 +14,9 @@ import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
 if __name__ == '__main__':
+    seed=42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
@@ -124,7 +127,6 @@ if __name__ == '__main__':
         next_token_logits = outputs.logits[:, -1, :]
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, next_token_logits)
-        print(intermediate_results[0].shape, next_tokens_scores)
         next_tokens = torch.argmax(next_tokens_scores, dim=-1)
         new_input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         return new_input_ids

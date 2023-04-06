@@ -14,6 +14,9 @@ import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
 if __name__ == '__main__':
+    seed=42
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
@@ -124,7 +127,6 @@ if __name__ == '__main__':
         next_token_logits = outputs.logits[:, -1, :]
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, next_token_logits)
-        print(intermediate_results[0].shape, next_tokens_scores)
         next_tokens = torch.argmax(next_tokens_scores, dim=-1)
         new_input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         return new_input_ids, next_tokens
@@ -151,19 +153,10 @@ if __name__ == '__main__':
     num_tokens_to_generate = 8
     original_token = copy.deepcopy(input_ids)
 
-    embed_tokens = model_pre_and_post.model.decoder.embed_tokens
-    pos_embeds = model_pre_and_post.model.decoder.embed_positions
+    
     for i in range(num_tokens_to_generate):
         new_input_ids, next_tokens = generate_one_token(request_token, input_ids)
-        request_token = model_pre_and_post.preprocess(new_input_ids, use_cache=True, request_id=1)
-        
-        inputs_embeds = embed_tokens(new_input_ids)
-        next_token_embeds = embed_tokens(next_tokens).view(1, 1, -1)
-        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-        p_embeds = pos_embeds(attention_mask, input_ids_seq_length + i)
-        attention_mask = model_pre_and_post.model.decoder._prepare_decoder_attention_mask(attention_mask, (1,1), inputs_embeds, input_ids_seq_length + i)
-        request_token = (next_token_embeds, attention_mask) + request_token[2:]
-        # print("KV Cache Size 2: ", get_iter_variable_size(model.model.decoder.kv_cache, unit='MB'))
+        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_tokens, request_token)
         input_ids = new_input_ids
         # print(input_ids)
 
