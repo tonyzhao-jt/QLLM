@@ -32,8 +32,12 @@ class ModelMemEstimator:
         return self.calculate_single_selfattn_mem() + self.calculate_single_FFN_mem() 
     
     def calculate_single_layer_maximum_kv_cache(self):
-        size = self.b * self.h1 & (self.s + self.n) * 2 * 4 #(k and v)
+        size = self.b * self.h1 * (self.s + self.n - 1) * 2 * 2 #(k and v), store in fp16
         return size 
+    
+    def calculate_single_layer_ln_weight(self):
+        size = self.h1 * 2 * 2 # 2 means fp16
+        return size
     
     def calculate_multiple_layer_selfattn_mem(self, layer_num):
         return self.calculate_single_selfattn_mem() * layer_num
@@ -69,7 +73,8 @@ class ModelMemEstimator:
                         bit = 8
                         kv_size = kv_size * bit / 32 # the feature supported by pure int8
                     selfattn_mem = selfattn_mem * bit / 32 
-                    all_size_estimation += selfattn_mem + kv_size
+                    ln_size = self.calculate_single_layer_ln_weight()
+                    all_size_estimation += selfattn_mem + kv_size + ln_size
                 elif value == 1:
                     ffn_mem = self.calculate_single_FFN_mem()
                     bit = bits[idx]
@@ -78,4 +83,13 @@ class ModelMemEstimator:
                     ffn_mem = ffn_mem * bit / 32
                     all_size_estimation += ffn_mem
         return f"{convert_to_unit(all_size_estimation, unit)} {unit}" 
+    
+    def estimate_hidden_space(self):
+        print(self.b, self.s + self.n - 1, self.h1)
+        return self.h1 * self.b * (self.s + self.n - 1)
+
+    def estimate_single_layer_kv_cache(self):
+        print(self.b, (self.s + self.n - 1), self.h1)
+        return self.calculate_single_layer_maximum_kv_cache()
+
                 

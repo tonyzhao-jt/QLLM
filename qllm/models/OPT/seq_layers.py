@@ -312,7 +312,7 @@ class OPTAttentionSeq(nn.Module):
         query_states = self._shape(query_states, tgt_len, bsz).view(*proj_shape)
         key_states = key_states.view(*proj_shape)
         value_states = value_states.view(*proj_shape)
-
+        
         src_len = key_states.size(1)
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
@@ -528,7 +528,7 @@ class OPTDecoderLayerSharded(nn.Module):
         
         # use kv cache
         if use_cache:
-            outputs = (hidden_states,) + present_key_value
+            outputs = (hidden_states, present_key_value)  
         else:
             outputs = (hidden_states,)
 
@@ -591,10 +591,10 @@ class OPTDecoderLayerSharded(nn.Module):
             # hidden states here are tuple
             if 1 in self.partitions:
                 if use_cache:
-                    present_key_value = hidden_states[1] # tensor
+                    present_key_value = hidden_states[1] # tuple of two tensors (k and v)
                 hidden_states = hidden_states[0]
                 outputs = self.FFN_PART(hidden_states)
-                return outputs if not use_cache else outputs + (present_key_value, ) # return tuple
+                return outputs if not use_cache else outputs + present_key_value
             else:
                 return hidden_states
         # Fully Connected
@@ -608,6 +608,7 @@ class OPTDecoderSeq(OPTDecoder):
         super().__init__(config)
         self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
     
+    
     def forward_pre(self, 
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -617,7 +618,8 @@ class OPTDecoderSeq(OPTDecoder):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,):
+        return_dict: Optional[bool] = None,
+        past_key_values_length: int = 0):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -637,7 +639,7 @@ class OPTDecoderSeq(OPTDecoder):
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
-        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        # past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -646,7 +648,6 @@ class OPTDecoderSeq(OPTDecoder):
         if attention_mask is None:
             attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
         pos_embeds = self.embed_positions(attention_mask, past_key_values_length)
-
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
@@ -728,11 +729,12 @@ class OPTDecoderSeq(OPTDecoder):
         del self.project_out
     
     def update_kv_cache(self, layer_idx, key_value_pair, request_id):
-        if hasattr(self, 'kv_cache'):
+        if not hasattr(self, 'kv_cache'):
             self.kv_cache = {}
         if layer_idx not in self.kv_cache:
             self.kv_cache[layer_idx] = {}
         self.kv_cache[layer_idx][request_id] = key_value_pair
+
 
     def get_kv_cache(self, layer_idx, request_id):
         if not hasattr(self, 'kv_cache'):
@@ -785,7 +787,10 @@ class OPTDecoderSeq(OPTDecoder):
             if decoder_layer.has_self_attention(): # store the kv together with the selfattn
                 if use_cache:
                     # the output will contain a present key value
-                    self.update_kv_cache(idx, layer_outputs[1], request_id) # update for further usage
+                    if type(layer_outputs[1]) == tuple:
+                        self.update_kv_cache(idx, layer_outputs[1], request_id)
+                    else:
+                        self.update_kv_cache(idx, layer_outputs[1:], request_id) # update for further usage
 
             if decoder_layer.is_only_self_attention():
                 hidden_states = (layer_outputs[0], ) # 
@@ -857,7 +862,8 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         self.post_init()
 
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
-                   use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1):
+                   use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1, \
+                    past_key_values_length: int = 0, **kwargs):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -874,10 +880,10 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            past_key_values_length=past_key_values_length,
         )
 
         # add broadcast here for dist
-        past_key_values = pre_result['past_key_values']
         attention_mask = pre_result['attention_mask']
         head_mask = pre_result['head_mask']
         use_cache = use_cache
@@ -930,7 +936,6 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
             attention_mask, head_mask, use_cache, request_id = prev_result[1:]
-
             return module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,

@@ -124,9 +124,10 @@ if __name__ == '__main__':
         next_token_logits = outputs.logits[:, -1, :]
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, next_token_logits)
+        print(intermediate_results[0].shape, next_tokens_scores)
         next_tokens = torch.argmax(next_tokens_scores, dim=-1)
         new_input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-        return new_input_ids
+        return new_input_ids, next_tokens
 
     # prepare the logits processor
     logits_processor = LogitsProcessorList()
@@ -143,33 +144,36 @@ if __name__ == '__main__':
         prefix_allowed_tokens_fn=None,
         logits_processor=logits_processor,
     )
+    
     # generate input token
     request_token = model_pre_and_post.preprocess(input_ids, use_cache=True, request_id=1)
-    request_token2 = model_pre_and_post.preprocess(input_ids, use_cache=True, request_id=2)
 
     num_tokens_to_generate = 8
     original_token = copy.deepcopy(input_ids)
-    input_ids2 = copy.deepcopy(input_ids)
+
+    embed_tokens = model_pre_and_post.model.decoder.embed_tokens
+    pos_embeds = model_pre_and_post.model.decoder.embed_positions
     for i in range(num_tokens_to_generate):
-        new_input_ids = generate_one_token(request_token, input_ids)
-        new_input_ids2 = generate_one_token(request_token2, input_ids2)
+        new_input_ids, next_tokens = generate_one_token(request_token, input_ids)
         request_token = model_pre_and_post.preprocess(new_input_ids, use_cache=True, request_id=1)
-        request_token2 = model_pre_and_post.preprocess(new_input_ids2, use_cache=True, request_id=2)
+        
+        inputs_embeds = embed_tokens(new_input_ids)
+        next_token_embeds = embed_tokens(next_tokens).view(1, 1, -1)
+        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
+        p_embeds = pos_embeds(attention_mask, input_ids_seq_length + i)
+        attention_mask = model_pre_and_post.model.decoder._prepare_decoder_attention_mask(attention_mask, (1,1), inputs_embeds, input_ids_seq_length + i)
+        request_token = (next_token_embeds, attention_mask) + request_token[2:]
         # print("KV Cache Size 2: ", get_iter_variable_size(model.model.decoder.kv_cache, unit='MB'))
-
         input_ids = new_input_ids
-        input_ids2 = new_input_ids2
+        # print(input_ids)
 
-    print(original_token.shape, new_input_ids.shape, new_input_ids2.shape)
     # print model 1, 2, 3 size in MB
     print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
 
     result_one_time = tokenizer.batch_decode(new_input_ids, skip_special_tokens=True)
-    result_one_time2 = tokenizer.batch_decode(new_input_ids2, skip_special_tokens=True)
     print("Onetime Run: ", result_one_time)
-    print("Onetime Run 2: ", result_one_time2)
     
 
 

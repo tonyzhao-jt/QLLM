@@ -174,7 +174,6 @@ class SequentialGenerate:
                           model_kwargs):
         # prepare model inputs
         model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
-
         # forward pass to get next token
         if not self.seq_execute:
             outputs = self.model(
@@ -182,6 +181,7 @@ class SequentialGenerate:
                 return_dict=True,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
+                
             )
         else:
             outputs = self.enqueue(model_inputs)
