@@ -156,7 +156,7 @@ if __name__ == '__main__':
     
     for i in range(num_tokens_to_generate):
         new_input_ids, next_tokens = generate_one_token(request_token, input_ids)
-        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_tokens, request_token)
+        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_tokens, use_cache=True, request_id=1)
         input_ids = new_input_ids
         # print(input_ids)
 

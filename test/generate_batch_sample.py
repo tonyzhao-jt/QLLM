@@ -154,8 +154,8 @@ if __name__ == '__main__':
     for i in range(num_tokens_to_generate):
         new_input_ids, next_token = generate_one_token(request_token, input_ids)
         new_input_ids2, next_token2 = generate_one_token(request_token2, input_ids2)
-        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_token, request_token)
-        request_token2 = model_pre_and_post.preprocess_one_token(new_input_ids, next_token2, request_token2)
+        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_token, use_cache=True, request_id=1)
+        request_token2 = model_pre_and_post.preprocess_one_token(new_input_ids, next_token2, use_cache=True, request_id=2)
         # print("KV Cache Size 2: ", get_iter_variable_size(model.model.decoder.kv_cache, unit='MB'))
 
         input_ids = new_input_ids

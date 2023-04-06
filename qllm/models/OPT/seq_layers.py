@@ -861,7 +861,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
-    def preprocess_one_token(self, new_input_ids, next_tokens, request_token):
+    def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1):
         input_ids_seq_length = new_input_ids.shape[1] - 1
         embed_tokens = self.model.decoder.embed_tokens
         pos_embeds = self.model.decoder.embed_positions
@@ -877,7 +877,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
         # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
         next_token_embeds = next_token_embeds + p_embeds[-1:]
-        request_token = (next_token_embeds, attention_mask) + request_token[2:]
+        request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
         return request_token
 
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
