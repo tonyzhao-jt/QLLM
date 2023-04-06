@@ -16,7 +16,9 @@ from transformers import LogitsProcessorList, StoppingCriteriaList
 if __name__ == '__main__':
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
-    batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog", "what is others"], padding=True, return_tensors="pt")
+    batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog. ", "Just test performance. How about you. ", \
+                                                "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], padding=True, return_tensors="pt")
+    
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m", torch_dtype=torch.float16)
     sharding_strategy = {
         0: {

@@ -876,7 +876,9 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
         attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
         # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
-        next_token_embeds = next_token_embeds + p_embeds[-1:]
+        if self.model.decoder.project_in is not None:
+            next_token_embeds = self.model.decoder.project_in(next_token_embeds)
+        next_token_embeds = next_token_embeds + p_embeds
         request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
         return request_token
 
