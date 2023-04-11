@@ -154,9 +154,25 @@ class Int8OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        print(query_states.shape, key_states.shape)
-        print(query_states.dtype, key_states.dtype)
-        attn_weights = self.qk_bmm(query_states, key_states)
+        # for int8, N(src_length) need to be multiple of 16, padding here
+        # pad_len = (16 - src_len % 16) % 16
+        # padding = torch.zeros(key_states.size(0), pad_len, key_states.size(2), dtype=key_states.dtype, device=key_states.device)
+        # key_states = torch.cat([key_states, padding], dim=1)
+
+        # value_length = value_states.size(1)
+        # value_pad_length = (16 - value_states.size(1) % 16) % 16 
+        # padding_v = torch.zeros(value_states.size(0), value_pad_length, value_states.size(2), dtype=key_states.dtype, device=key_states.device)
+        # value_states = torch.cat([value_states, padding_v], dim=1)
+        # src_len = src_len + pad_len
+        # print(query_states.shape, key_states.shape)
+        # print(query_states.dtype, key_states.dtype)
+        # import pdb; pdb.set_trace()
+        # the bmm can only done in fp16. requires strict alginment and padding
+        # attn_weights = self.qk_bmm(query_states, key_states)
+        if src_len % 16:
+            attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
+        else:
+            attn_weights = self.qk_bmm(query_states, key_states)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -202,11 +218,15 @@ class Int8OPTAttention(nn.Module):
             attn_probs_reshaped = None
 
         # (A_row V_row)_row = (A_row V_col ^T)_row
-        attn_probs.mul_(127).round_()
-        attn_probs = attn_probs.to(torch.int8)
 
-        value_states = value_states.transpose(1, 2).contiguous()
-        attn_output = self.pv_bmm(attn_probs, value_states)
+        if src_len % 16:
+            attn_output = torch.bmm(attn_probs.half(), value_states.half())
+            attn_output = attn_output.to(torch.int8)
+        else:
+            attn_probs.mul_(127).round_()
+            attn_probs = attn_probs.to(torch.int8)
+            value_states = value_states.transpose(1, 2).contiguous()
+            attn_output = self.pv_bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -314,6 +334,7 @@ class OPTAttentionSeq(nn.Module):
         value_states = value_states.view(*proj_shape)
         
         src_len = key_states.size(1)
+        # print(query_states.size(), key_states.size())
         attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
@@ -414,10 +435,19 @@ class OPTDecoderLayerSharded(nn.Module):
     # Need to verify whether it is available on the current GPU.
     def verify_kernel(self):
         test_result = []
+        self_attn_fake_bits, ffn_fake_bits = 16, 16
+        for idx, part_idx in enumerate(self.partitions):
+            bit = self.bits[idx]
+            if part_idx == 0:
+                self_attn_fake_bits = bit
+            if part_idx == 1:
+                ffn_fake_bits = bit
+
         for part, input_shape in self.test_input_shape.items():
             if part == 'self_attn':
                 try:
-                    fake_input = torch.randn(input_shape).cuda().half()
+                    fake_input = torch.randn(input_shape).cuda().half() if self_attn_fake_bits == 16 else \
+                        torch.randint(-128, 127, input_shape, dtype=torch.int8).cuda()
                     test_attn = self.self_attn.cuda()
                     fake_output = test_attn(fake_input)
                     del test_attn, fake_output
@@ -427,7 +457,8 @@ class OPTDecoderLayerSharded(nn.Module):
                     test_result.append(False)
             if part == 'FFN':
                 try:
-                    fake_input = torch.randn(input_shape).cuda().half()
+                    fake_input = torch.randn(input_shape).cuda().half() if ffn_fake_bits == 16 else \
+                            torch.randint(-128, 127, input_shape, dtype=torch.int8).cuda()
                     test_fc1 = self.fc1.cuda()
                     test_ln = self.final_layer_norm.cuda()
                     test_fc2 = self.fc2.cuda()
@@ -445,6 +476,7 @@ class OPTDecoderLayerSharded(nn.Module):
     def shard(self, shard_strategy):
         self.set_partition(shard_strategy.get('shard', []))
         bits = shard_strategy.get('bits', [])
+        self.bits = bits
         assert len(self.partitions) == len(bits), "shard and bitwidths should have the same length"
 
         if 0 not in self.partitions:
@@ -474,6 +506,11 @@ class OPTDecoderLayerSharded(nn.Module):
                     _, out_input_scale = caliber.get_module_calib_data(self.self_attn.out_proj)
                     self.self_attn = Int8OPTAttention.from_float(
                         self.self_attn, attn_input_scale, q_output_scale, k_output_scale, v_output_scale, out_input_scale)
+                    
+                    if self.do_layer_norm_before:
+                        self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
+                    else:
+                        self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, out_input_scale)
                 # TODO: for moment, we disable the torchint by passing none to caliber
                 elif bit == "8:tc-li":
                     bit = 8
