@@ -439,10 +439,10 @@ class OPTDecoderLayerSharded(nn.Module):
         for idx, part_idx in enumerate(self.partitions):
             bit = self.bits[idx]
             if part_idx == 0:
-                self_attn_fake_bits = bit
+                self_attn_fake_bits = 16 if bit != '8:tc' else 8
             if part_idx == 1:
-                ffn_fake_bits = bit
-
+                ffn_fake_bits = 16 if bit != '8:tc' else 8
+        
         for part, input_shape in self.test_input_shape.items():
             if part == 'self_attn':
                 try:
