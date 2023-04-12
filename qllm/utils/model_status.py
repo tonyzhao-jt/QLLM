@@ -22,7 +22,7 @@ def get_model_size(model, unit='bytes'):
     else:
         raise ValueError(f"Invalid unit: {unit}")
         
-    return f"Total size of the model: {size:.2f} {unit_str}"
+    return size, f"Total size of the model: {size:.2f} {unit_str}"
 
 # only calculate the tensors on cuda
 def get_model_size_cuda(model, unit='bytes'):
@@ -45,7 +45,7 @@ def get_model_size_cuda(model, unit='bytes'):
     else:
         raise ValueError(f"Invalid unit: {unit}")
         
-    return f"Total size of the model: {size:.2f} {unit_str}"
+    return size, f"Total size of the model: {size:.2f} {unit_str}"
 
 
 # list all tensors on cuda

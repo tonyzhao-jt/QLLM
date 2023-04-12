@@ -9,46 +9,64 @@ from transformers import (
 model_cards = {
     '125M': OPTConfig(
         hidden_size=768,
+        ffn_dim=3072,
+        word_embed_proj_dim=768,
         num_attention_heads=12,
         num_hidden_layers=24,
     ),
     '350M': OPTConfig(
         hidden_size=1024,
+        ffn_dim=4096,
+        word_embed_proj_dim=512,
         num_hidden_layers=24,
         num_attention_heads=16,
     ),
     '1.3b': OPTConfig(
         hidden_size=2048,
+        ffn_dim=8192,
+        word_embed_proj_dim=2048,
         num_hidden_layers=24,
         num_attention_heads=32
     ),
     '2.7b': OPTConfig(
         hidden_size=2560,
+        ffn_dim=10240,
+        word_embed_proj_dim=2560,
         num_hidden_layers=32,
         num_attention_heads=32
     ),
     '6.7b': OPTConfig(
         hidden_size=4096,
+        ffn_dim=16384,
+        word_embed_proj_dim=4096,
         num_hidden_layers=32,
         num_attention_heads=32
     ),
     '13b': OPTConfig(
         hidden_size=5120,
+        ffn_dim=20480,
+        word_embed_proj_dim=5120,
         num_hidden_layers=40,
         num_attention_heads=40,
     ),
     '30b': OPTConfig(
         hidden_size=7168,
+        ffn_dim=28672,
+        word_embed_proj_dim=7168,
         num_hidden_layers=48,
         num_attention_heads=56,
     ),
     '66b': OPTConfig(
         hidden_size=9216,
+        ffn_dim=36864,
+        word_embed_proj_dim=9216,
         num_hidden_layers=64,
         num_attention_heads=72,
     ),
     '175b': OPTConfig(
         hidden_size=12288,
+        ffn_dim=49152,
+        word_embed_proj_dim=12288,
         num_hidden_layers=96,
         num_attention_heads=96,
     ),

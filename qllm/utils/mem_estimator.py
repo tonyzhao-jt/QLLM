@@ -32,7 +32,7 @@ class ModelMemEstimator:
         return self.calculate_single_selfattn_mem() + self.calculate_single_FFN_mem() 
     
     def calculate_single_layer_maximum_kv_cache(self):
-        size = self.b * self.h1 * (self.s + self.n - 1) * 2 * 2 #(k and v), store in fp16
+        size = self.b * self.h1 * (self.s + self.n) * 2 * 2 #(k and v), store in fp16
         return size 
     
     def calculate_single_layer_ln_weight(self):
@@ -50,8 +50,31 @@ class ModelMemEstimator:
     
     def calculate_multiple_layer_kv_cache(self, layer_num):
         return self.calculate_single_layer_maximum_kv_cache() * layer_num
+    
+    def calculate_kv_occupation_of_partition(self, partition, unit='b'):
+        # partition should be with format
+        # {0: {"shard": [0,1], "bits": [8,8]}}
+        all_size_estimation = 0
+        for layer, config in partition.items():
+            shard = config["shard"]
+            bits = config["bits"]
+            
+            if len(shard) != len(bits):
+                raise ValueError("shard and bits should have same length")
 
-    def calculate_maximum_mem_occupation_of_partition(self, partition, unit='b'):
+            for idx, value in enumerate(shard):
+                if value == 0:
+                    # add the kv size
+                    kv_size = self.calculate_single_layer_maximum_kv_cache()
+                    # bits
+                    bit = bits[idx]
+                    if type(bit) != int:
+                        bit = 8
+                        kv_size = kv_size * bit / 32 # the feature supported by pure int8
+                    all_size_estimation += kv_size 
+        return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
+    
+    def calculate_model_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format
         # {0: {"shard": [0,1], "bits": [8,8]}}
         all_size_estimation = 0
@@ -65,16 +88,13 @@ class ModelMemEstimator:
             for idx, value in enumerate(shard):
                 if value == 0:
                     selfattn_mem = self.calculate_single_selfattn_mem()
-                    # add the kv size
-                    kv_size = self.calculate_single_layer_maximum_kv_cache()
                     # bits
                     bit = bits[idx]
                     if type(bit) != int:
                         bit = 8
-                        kv_size = kv_size * bit / 32 # the feature supported by pure int8
                     selfattn_mem = selfattn_mem * bit / 32 
                     ln_size = self.calculate_single_layer_ln_weight()
-                    all_size_estimation += selfattn_mem + kv_size + ln_size
+                    all_size_estimation += selfattn_mem + ln_size
                 elif value == 1:
                     ffn_mem = self.calculate_single_FFN_mem()
                     bit = bits[idx]
@@ -82,14 +102,23 @@ class ModelMemEstimator:
                         bit = 8
                     ffn_mem = ffn_mem * bit / 32
                     all_size_estimation += ffn_mem
-        return f"{convert_to_unit(all_size_estimation, unit)} {unit}" 
+        return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
+
+    def calculate_maximum_mem_occupation_of_partition(self, partition, unit='b'):
+        # partition should be with format
+        # {0: {"shard": [0,1], "bits": [8,8]}}
+        all_size_estimation = 0
+        kv_mem = self.calculate_kv_occupation_of_partition(partition, unit)[0]
+        model_mem = self.calculate_model_occupation_of_partition(partition, unit)[0]
+        all_size_estimation = kv_mem + model_mem
+        return all_size_estimation, f"{all_size_estimation} {unit}" 
     
     def estimate_hidden_space(self):
         print(self.b, self.s + self.n - 1, self.h1)
         return self.h1 * self.b * (self.s + self.n - 1)
 
-    def estimate_single_layer_kv_cache(self):
+    def estimate_single_layer_kv_cache(self, unit='b'):
         print(self.b, (self.s + self.n - 1), self.h1)
-        return self.calculate_single_layer_maximum_kv_cache()
+        return self.calculate_single_layer_maximum_kv_cache(), f"{convert_to_unit(self.calculate_single_layer_maximum_kv_cache(), unit)} {unit}"
 
                 

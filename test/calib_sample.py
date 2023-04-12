@@ -10,10 +10,11 @@ from qllm.models.OPT import OPTForCausalLMSeq
 import lptorch
 import torch
 if __name__ == '__main__':
-    opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-350m')
+    model_size = '125m'.lower()
+    opt_125M, tokenizer = opt.load_pretained_model_from_net(f'facebook/opt-{model_size}')
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
-    weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-350m", torch_dtype=torch.float32)
+    weight_loaded_model = OPTForCausalLMSeq.from_pretrained(f"facebook/opt-{model_size}", torch_dtype=torch.float32)
     
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
@@ -23,7 +24,7 @@ if __name__ == '__main__':
     with torch.no_grad():
         weight_loaded_model(input_ids)
     caliber.remove_forward_hooks()
-    caliber.save_calib_data('./opt_350M_calib_data.pkl')
+    caliber.save_calib_data(f'./opt_{model_size}_calib_data.pkl')
     caliber.clear_calib_data()
-    caliber.load_calib_data('./opt_350M_calib_data.pkl')
+    caliber.load_calib_data(f'./opt_{model_size}_calib_data.pkl')
 
