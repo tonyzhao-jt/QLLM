@@ -1023,25 +1023,26 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         self.post_init()
 
     def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1):
-        input_ids_seq_length = new_input_ids.shape[1] - 1
-        embed_tokens = self.model.decoder.embed_tokens
-        pos_embeds = self.model.decoder.embed_positions
-        # embed the new input tokens
+        with torch.no_grad():
+            input_ids_seq_length = new_input_ids.shape[1] - 1
+            embed_tokens = self.model.decoder.embed_tokens
+            pos_embeds = self.model.decoder.embed_positions
+            # embed the new input tokens
 
-        inputs_embeds = embed_tokens(new_input_ids)
-        next_token_embeds = embed_tokens(next_tokens)
-        bs = next_token_embeds.size(0)
-        input_shape = (bs, 1)
-        next_token_embeds = next_token_embeds.view(bs, 1, -1)
-        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-        p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
-        attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
-        # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
-        if self.model.decoder.project_in is not None:
-            next_token_embeds = self.model.decoder.project_in(next_token_embeds)
-        next_token_embeds = next_token_embeds + p_embeds
-        request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
-        return request_token
+            inputs_embeds = embed_tokens(new_input_ids)
+            next_token_embeds = embed_tokens(next_tokens)
+            bs = next_token_embeds.size(0)
+            input_shape = (bs, 1)
+            next_token_embeds = next_token_embeds.view(bs, 1, -1)
+            attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
+            p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
+            attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
+            # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
+            if self.model.decoder.project_in is not None:
+                next_token_embeds = self.model.decoder.project_in(next_token_embeds)
+            next_token_embeds = next_token_embeds + p_embeds
+            request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
+            return request_token
 
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
                    use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1, \
@@ -1113,54 +1114,55 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
     # rewrite the forward function
     def decode(self, pre_result):
+        with torch.no_grad():
+            def shard_launcher(prev_result, module_shard):
+                # length_prev_result = len(prev_result)
+                hidden_states = prev_result[0]
+                attention_mask, head_mask, use_cache, request_id = prev_result[1:]
+                return module_shard(
+                    hidden_states=hidden_states,
+                    next_decoder_cache=None,
+                    attention_mask=attention_mask,
+                    head_mask=head_mask,
+                    past_key_values=None,
+                    use_cache=use_cache,
+                    request_id=request_id,
+                )
 
-        def shard_launcher(prev_result, module_shard):
-            # length_prev_result = len(prev_result)
-            hidden_states = prev_result[0]
-            attention_mask, head_mask, use_cache, request_id = prev_result[1:]
-            return module_shard(
-                hidden_states=hidden_states,
-                next_decoder_cache=None,
-                attention_mask=attention_mask,
-                head_mask=head_mask,
-                past_key_values=None,
-                use_cache=use_cache,
-                request_id=request_id,
-            )
-
-        return shard_launcher(pre_result, self.model.decoder)
+            return shard_launcher(pre_result, self.model.decoder)
 
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
         return self.model.decoder.init_kv_cache(b, prompt_length, token_to_generate, request_id)
     
     def postprocess(self, results, labels=None):
-        # head_mask, attention_mask should be passed with the pre_result
-        # past_key_value should be stored within the model
-        return_dict = self.return_dict
-        hidden_states, attention_mask, head_mask, use_cache, request_id = results
-        next_decoder_cache = None
-        outputs = self.model.decoder.forward_post(
-            hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict
-        )
-        logits = self.lm_head(outputs[0]).contiguous()
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+        with torch.no_grad():
+            # head_mask, attention_mask should be passed with the pre_result
+            # past_key_value should be stored within the model
+            return_dict = self.return_dict
+            hidden_states, attention_mask, head_mask, use_cache, request_id = results
+            next_decoder_cache = None
+            outputs = self.model.decoder.forward_post(
+                hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict
+            )
+            logits = self.lm_head(outputs[0]).contiguous()
+            loss = None
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss_fct = CrossEntropyLoss()
+                loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            if not return_dict:
+                output = (logits,) + outputs[1:]
+                return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
-        )
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=outputs.past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+            )
 
     def forward(
             self,
