@@ -95,6 +95,7 @@ AVAILABLE_MAP = {
     "facebook/opt-2.7b": "https://huggingface.co/facebook/opt-2.7b/blob/main/config.json",
     "facebook/opt-6.7b": "https://huggingface.co/facebook/opt-6.7b/blob/main/config.json",
     "facebook/opt-13b": "https://huggingface.co/facebook/opt-13b/blob/main/config.json",
+    "facebook/opt-66b": "https://huggingface.co/facebook/opt-13b/blob/main/config.json",
 }
 
 def load_pretained_model_from_net(repo_name, dtype=torch.float16):

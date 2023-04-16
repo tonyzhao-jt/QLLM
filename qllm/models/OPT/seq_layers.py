@@ -41,6 +41,7 @@ from lptorch.utils import is_tensorcore_int8_available
 from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
 from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
 from lptorch.torch_int.nn.fused import LayerNormQ
+
 class Int8OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -643,8 +644,17 @@ class OPTDecoderLayerSharded(nn.Module):
 class OPTDecoderSeq(OPTDecoder):
     def __init__(self, config: OPTConfig):
         super().__init__(config)
-        self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
-    
+        import os 
+        set_decoder_meta = os.environ.get('SET_DECODERS_META', "0")
+        if set_decoder_meta == "0":
+            self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
+        else:
+            from accelerate import init_empty_weights
+            del self.layers
+            with init_empty_weights():
+                self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
+
+            
     
     def forward_pre(self, 
         input_ids: torch.LongTensor = None,
@@ -741,6 +751,11 @@ class OPTDecoderSeq(OPTDecoder):
     def get_decoder_layer_num(self):
         return len(self.layers)
 
+    def check_is_meta(self, layer):
+        for name, param in layer.named_parameters():
+            if 'weight' in name:
+                return param.is_meta
+
     # inplace sharding
     def _shard_decoders(self, sharding_strategy):
         layer_idxs = list(sharding_strategy.keys())
@@ -751,6 +766,9 @@ class OPTDecoderSeq(OPTDecoder):
                 del del_ele
         # for each layer, start sharding
         for layer_idx in layer_idxs:
+            layer = self.layers[layer_idx]
+            if self.check_is_meta(layer):
+                self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
     
     def verify_decoder_layers(self):
