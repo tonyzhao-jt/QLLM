@@ -64,6 +64,11 @@ if __name__ == '__main__':
     model.decoder_layers_to_device(device)
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
+    model_packs = [model, model_2, model_3]
+
+    # init KV cache
+    num_tokens_to_generate = 10
+    bs, prompt_length = batched_ids['input_ids'].shape
     # becareful to use this one
     batched_ids = to_device_recursive(dict(batched_ids), device)
 
@@ -104,7 +109,11 @@ if __name__ == '__main__':
     request_token = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=1)
     request_token2 = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=2)
 
-    num_tokens_to_generate = 8
+    # init kv cache for all requests
+    for k_model in model_packs:
+        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
+        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=2)
+    
     original_token = copy.deepcopy(input_ids)
     input_ids2 = copy.deepcopy(input_ids)
     for i in range(num_tokens_to_generate):

@@ -97,6 +97,11 @@ if __name__ == '__main__':
     opt_125M = opt_125M.cuda()
     # becareful to use this one
     input_ids = input_ids.cuda()
+    model_packs = [model, model_2, model_3]
+
+    # init KV cache
+    num_tokens_to_generate = 10
+    bs, prompt_length = input_ids.shape
 
     # eval mode
     # model.eval()
@@ -150,8 +155,11 @@ if __name__ == '__main__':
     # generate input token
     request_token = model_pre_and_post.preprocess(input_ids, use_cache=True, request_id=1)
 
-    num_tokens_to_generate = 8
     original_token = copy.deepcopy(input_ids)
+
+    # init kv cache for all requests
+    for k_model in model_packs:
+        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
 
     
     for i in range(num_tokens_to_generate):

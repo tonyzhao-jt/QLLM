@@ -15,6 +15,8 @@ from transformers.models.opt.modeling_opt import (
     OPTLearnedPositionalEmbedding,
     OPTModel,
     OPTDecoder,
+    OPTPreTrainedModel,
+    _make_causal_mask, _expand_mask
 )
 # output decorator
 from transformers.modeling_outputs import (
@@ -32,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import random
 from dataclasses import dataclass
 import copy
+from accelerate import init_empty_weights
 
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
@@ -641,19 +644,80 @@ class OPTDecoderLayerSharded(nn.Module):
             return outputs
         raise ValueError("No partition is specified")
 
-class OPTDecoderSeq(OPTDecoder):
+class OPTDecoderSeq(OPTPreTrainedModel):
     def __init__(self, config: OPTConfig):
         super().__init__(config)
+        self.dropout = config.dropout
+        self.layerdrop = config.layerdrop
+        self.padding_idx = config.pad_token_id
+        self.max_target_positions = config.max_position_embeddings
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.word_embed_proj_dim, self.padding_idx)
+        self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings, config.hidden_size)
+
+        if config.word_embed_proj_dim != config.hidden_size:
+            self.project_out = nn.Linear(config.hidden_size, config.word_embed_proj_dim, bias=False)
+        else:
+            self.project_out = None
+
+        if config.word_embed_proj_dim != config.hidden_size:
+            self.project_in = nn.Linear(config.word_embed_proj_dim, config.hidden_size, bias=False)
+        else:
+            self.project_in = None
+
+        # Note that the only purpose of `config._remove_final_layer_norm` is to keep backward compatibility
+        # with checkpoints that have been fine-tuned before transformers v4.20.1
+        # see https://github.com/facebookresearch/metaseq/pull/164
+        if config.do_layer_norm_before and not config._remove_final_layer_norm:
+            self.final_layer_norm = nn.LayerNorm(
+                config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+            )
+        else:
+            self.final_layer_norm = None
+        
         import os 
         set_decoder_meta = os.environ.get('SET_DECODERS_META', "0")
         if set_decoder_meta == "0":
             self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
         else:
-            from accelerate import init_empty_weights
-            del self.layers
             with init_empty_weights():
                 self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
+        # self.layers = nn.ModuleList([OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init() # init weights
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
+                inputs_embeds.device
+            )
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+
+        return combined_attention_mask
             
     
     def forward_pre(self, 
@@ -783,22 +847,59 @@ class OPTDecoderSeq(OPTDecoder):
         del self.project_in
         del self.project_out
     
-    def update_kv_cache(self, layer_idx, key_value_pair, request_id):
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
         if not hasattr(self, 'kv_cache'):
             self.kv_cache = {}
-        if layer_idx not in self.kv_cache:
-            self.kv_cache[layer_idx] = {}
-        self.kv_cache[layer_idx][request_id] = key_value_pair
+        max_seq_len = prompt_length + token_to_generate
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if decoder_layer is None:
+                continue
+            if not decoder_layer.has_self_attention():
+                continue
+            bits = decoder_layer.bits[0]
+            if bits == '8:tc':
+                kv_bit = 8
+                torch_dtype = torch.int8
+            else:
+                kv_bit = 16
+                torch_dtype = torch.float16
+            hidden_size, head_num = self.config.hidden_size, self.config.num_attention_heads
+            # size should be b x i x h
+            if layer_idx not in self.kv_cache:
+                self.kv_cache[layer_idx] = {}
+            self.kv_cache[layer_idx][request_id] = [
+                # size should be 
+                torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
+                torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
+                0, # use to count the token generation
+                prompt_length
+            ]
+    
+    def update_kv_cache(self, layer_idx, key_value_pair, request_id):
+        if not hasattr(self, 'kv_cache'):
+            assert False, "kv_cache not initialized"
+        # copy the key value pair to the cache
+        # self.kv_cache[layer_idx][request_id] = key_value_pair
+        self.kv_cache[layer_idx][request_id][2] += 1
+        self.kv_cache[layer_idx][request_id][0][:, :, :self.kv_cache[layer_idx][request_id][2] + self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[0])
+        self.kv_cache[layer_idx][request_id][1][:, :, :self.kv_cache[layer_idx][request_id][2] + \
+                                                    self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[1])
 
 
     def get_kv_cache(self, layer_idx, request_id):
         if not hasattr(self, 'kv_cache'):
-            self.kv_cache = {}
-        if layer_idx not in self.kv_cache:
+            assert False, "kv_cache not initialized"
+        # based on the prompt_length + previous token length to fetch kv
+        prompt_length = self.kv_cache[layer_idx][request_id][3]
+        generated_token_length = self.kv_cache[layer_idx][request_id][2]
+        kv_output_length = prompt_length + generated_token_length - 1
+        if generated_token_length == 0:
             return None
-        if request_id not in self.kv_cache[layer_idx]:
-            return None
-        return self.kv_cache[layer_idx][request_id]
+        kv = (
+            self.kv_cache[layer_idx][request_id][0][:, :, :kv_output_length, :],
+            self.kv_cache[layer_idx][request_id][1][:, :, :kv_output_length, :]
+        )
+        return kv
     
     def verbose_kv_cache(self):
         print(self.kv_cache)
@@ -829,7 +930,10 @@ class OPTDecoderSeq(OPTDecoder):
             if decoder_layer is None:
                 continue
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            past_key_value = self.get_kv_cache(idx, request_id)
+            if decoder_layer.has_self_attention():
+                past_key_value = self.get_kv_cache(idx, request_id)
+            else:
+                past_key_value = None
             # past_key_value = past_key_values[idx] if past_key_values is not None else None
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -860,7 +964,8 @@ class OPTDecoderSeq(OPTDecoder):
 # only to decoder
 class OPTModelSeq(OPTModel):
     def __init__(self, config: OPTConfig):
-        super().__init__(config)
+        with init_empty_weights():
+            super().__init__(config)
         self.decoder = OPTDecoderSeq(config)
         # Initialize weights and apply final processing
         self.post_init()
@@ -909,7 +1014,8 @@ class OPTModelSeq(OPTModel):
 
 class OPTForCausalLMSeq(OPTForCausalLM):
     def __init__(self, config):
-        super().__init__(config)
+        with init_empty_weights():
+            super().__init__(config)
         self.model = OPTModelSeq(config)
         # the lm_head weight is automatically tied to the embed tokens weight
         self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False)
@@ -1024,7 +1130,9 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
         return shard_launcher(pre_result, self.model.decoder)
 
-
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
+        return self.model.decoder.init_kv_cache(b, prompt_length, token_to_generate, request_id)
+    
     def postprocess(self, results, labels=None):
         # head_mask, attention_mask should be passed with the pre_result
         # past_key_value should be stored within the model

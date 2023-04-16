@@ -87,6 +87,11 @@ if __name__ == '__main__':
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
     model_2 = weight_loaded_model.shard_model(sharding_strategy, 1)
     model_3 = weight_loaded_model.shard_model(sharding_strategy, 2)
+    model_packs = [model, model_2, model_3]
+
+    # init KV cache
+    num_tokens_to_generate = 10
+    bs, prompt_length = input_ids['input_ids'].shape
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
