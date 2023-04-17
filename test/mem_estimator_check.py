@@ -60,7 +60,7 @@ if __name__ == '__main__':
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model_pre_and_post.cuda()
+    model_pre_and_post = model_pre_and_post.cuda()
     model.decoder_layers_to_device(device)
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
@@ -138,8 +138,15 @@ if __name__ == '__main__':
     n = num_tokens_to_generate # generated tokens
     request_num = 2
 
+    config = opt_125M.config
+    vocab_size = config.vocab_size
+    max_position_embeddings = config.max_position_embeddings
     print(h1, h2)
-    model_mem_estimator = ModelMemEstimator(h1, h2, b, s, n)
+    model_mem_estimator = ModelMemEstimator(h1, h2, b, s, n, \
+                                            vocab_size, max_position_embeddings)
+    # model pre and post size
+    print("Model pre and post size: ", get_model_size_cuda(model_pre_and_post.model, 'MB')[0] + get_model_size_cuda(model_pre_and_post.lm_head, 'MB')[0])
+    print("Est Model pre and post size: ", model_mem_estimator.calculate_prepost_mem(unit='MB')[1])
     # print model 1, 2, 3 size in MB
     print("Model 1 size: ", get_model_size_cuda(model.model, 'MB')[1])
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB')[1])

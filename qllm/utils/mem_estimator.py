@@ -1,6 +1,6 @@
 from .unit_handler import convert_to_unit
 class ModelMemEstimator:
-    def __init__(self, h1, h2, b, s, n) -> None:
+    def __init__(self, h1, h2, b, s, n, vocab_size=None, max_position_embeddings=None) -> None:
         # Refer to the flexGEN
         # h1 hidden dimension
         # h2 hidden dimension of second mlp
@@ -12,8 +12,25 @@ class ModelMemEstimator:
         self.b = b
         self.s = s
         self.n = n
-        pass
-
+        
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+    
+    def calculate_prepost_mem(self, unit='b', bit=16):
+        # contain token embedding and positional embedding. Positiona
+        if self.vocab_size is None:
+            print("Token embedding dim is not specified")
+            return 0
+        # calculate each embedding size
+        # 32 size
+        token_embedding_size = self.vocab_size * self.h1 * 4
+        max_pos_embedding_size = self.max_position_embeddings * self.h1 * 4
+        # lm_head
+        lm_head_weight_size = self.vocab_size * self.h1 * 4
+        mem_b = token_embedding_size + max_pos_embedding_size + lm_head_weight_size
+        mem_b = mem_b * bit / 32
+        mem_b += self.calculate_single_layer_ln_weight() * bit / 16
+        return convert_to_unit(mem_b, unit), f"{convert_to_unit(mem_b, unit)} {unit}"
     
     def calculate_single_selfattn_mem(self):
         # QKV storage + OUT projection, 4 linear

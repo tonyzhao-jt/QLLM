@@ -1099,6 +1099,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
     def _shard_model_current(self, shard_strategy, device=None):
         self.model.decoder._shard_decoders(shard_strategy, device)
         self.model.decoder._delete_all_other_modules()
+        del self.lm_head
 
     # inplace sharding
     def _shard_model(self, shard_strategies, shard_idx):
