@@ -22,7 +22,6 @@ from transformers.models.opt.modeling_opt import (
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    ModelOutput
 )
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
@@ -34,7 +33,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import random
 from dataclasses import dataclass
 import copy
-from accelerate import init_empty_weights
 
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
@@ -44,6 +42,8 @@ from lptorch.utils import is_tensorcore_int8_available
 from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
 from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
 from lptorch.torch_int.nn.fused import LayerNormQ
+
+from accelerate import init_empty_weights
 
 class Int8OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -681,8 +681,8 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         if set_decoder_meta == "0":
             self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
         else:
-            with init_empty_weights():
-                self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
+            # init empty
+            self.layers = nn.ModuleList([None for _ in range(config.num_hidden_layers)])
         # self.layers = nn.ModuleList([OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
         self.gradient_checkpointing = False
@@ -831,9 +831,17 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         # for each layer, start sharding
         for layer_idx in layer_idxs:
             layer = self.layers[layer_idx]
-            if self.check_is_meta(layer):
+            if layer is None:
                 self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
+                print("create layer:", layer_idx)
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
+    
+    def load_layer_weight(self, shard_weight_dir):
+        pass
+        # for layer in self.layers:
+        #     if layer is not None:
+        #         layer.load_weight()
+
     
     def verify_decoder_layers(self):
         for layer in self.layers:

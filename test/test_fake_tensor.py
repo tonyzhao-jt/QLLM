@@ -22,10 +22,10 @@ weight_loaded_model = OPTForCausalLMSeq._from_config(config, torch_dtype=torch.f
 decoder = weight_loaded_model.model.decoder
 
 for i in decoder.layers:
-    for name, param in i.named_parameters():
-        if 'weight' in name:
-            print(param.is_meta, end='')
-            break
+    if i is not None:
+        print("not none")
+    else:
+        print("none")
 
 # get cpu mem
 memory_used = psutil.virtual_memory().used
@@ -38,12 +38,10 @@ decoder._shard_decoders({
     3: {'shard': [0, 1], 'bits': [16, 16]},
 })
 
+print("after shard")
 for i in decoder.layers:
     if i is not None:
-        for name, param in i.named_parameters():
-            if 'weight' in name:
-                print(param.is_meta, end='')
-                break
+        print("layer", end='')
     else:
         print("None", end='')
 
