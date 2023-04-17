@@ -821,7 +821,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
                 return param.is_meta
 
     # inplace sharding
-    def _shard_decoders(self, sharding_strategy):
+    def _shard_decoders(self, sharding_strategy, device=None):
         layer_idxs = list(sharding_strategy.keys())
         for i in range(self.get_decoder_layer_num()):
             if i not in layer_idxs:
@@ -835,6 +835,9 @@ class OPTDecoderSeq(OPTPreTrainedModel):
                 self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
                 print("create layer:", layer_idx)
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
+            # directly move to device
+            if device is not None:
+                self.layers[layer_idx] = self.layers[layer_idx].to(device)
     
     def load_layer_weight(self, shard_weight_dir):
         pass
@@ -1093,8 +1096,8 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             all_decode_ids = all_decode_ids.union(decode_ids)
         assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
     
-    def _shard_model_current(self, shard_strategy):
-        self.model.decoder._shard_decoders(shard_strategy)
+    def _shard_model_current(self, shard_strategy, device=None):
+        self.model.decoder._shard_decoders(shard_strategy, device)
         self.model.decoder._delete_all_other_modules()
 
     # inplace sharding
