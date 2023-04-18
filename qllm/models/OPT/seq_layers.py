@@ -30,7 +30,6 @@ from transformers.activations import ACT2FN
 logger = logging.get_logger(__name__)
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-import random
 from dataclasses import dataclass
 import copy
 
@@ -499,8 +498,28 @@ class OPTDecoderLayerSharded(nn.Module):
             if partition == 0:
                 # deal with quantization here.
                 bit = bits[idx]
-                input_shape = caliber.get_module_input_shape(self.self_attn.q_proj)
-                self.test_input_shape['self_attn'] = input_shape
+                if not caliber.fake:
+                    input_shape = caliber.get_module_input_shape(self.self_attn.q_proj)
+                    self.test_input_shape['self_attn'] = input_shape
+                else:
+                    for k, v in caliber.named_fake_input_shape.items():
+                        if 'self_attn' in k:
+                            if 'q_proj' in k:
+                                self.test_input_shape['self_attn'] = v
+                            fake_calib_data = caliber.named_fake_calib_data[k]
+                            if 'q_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.q_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.q_proj, fake_calib_data)
+                            elif 'k_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.k_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.k_proj, fake_calib_data)
+                            elif 'v_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.v_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.v_proj, fake_calib_data)
+                            elif 'out_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.out_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.out_proj, fake_calib_data)
+
                 if bit == "8:tc": # tensorcore int8
                     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attn.q_proj) is not None, \
                         "Tensorcore is not available on this GPU, or the calibration data is not available"
@@ -524,8 +543,21 @@ class OPTDecoderLayerSharded(nn.Module):
                 
             elif partition == 1:
                 bit = bits[idx]
-                input_shape = caliber.get_module_input_shape(self.fc1)
-                self.test_input_shape['FFN'] = input_shape
+                if not caliber.fake:
+                    input_shape = caliber.get_module_input_shape(self.fc1)
+                    self.test_input_shape['FFN'] = input_shape
+                else:
+                    for k, v in caliber.named_fake_input_shape.items():
+                        if 'fc1' in k:
+                            self.test_input_shape['FFN'] = v
+                            fake_calib_data = caliber.named_fake_calib_data[k]
+                            unique_id = caliber.man_set_unique_id(self.fc1)
+                            caliber.man_set_module_calib_data(self.fc1, fake_calib_data)
+                        elif 'fc2' in k:
+                            fake_calib_data = caliber.named_fake_calib_data[k]
+                            unique_id = caliber.man_set_unique_id(self.fc2)
+                            caliber.man_set_module_calib_data(self.fc2, fake_calib_data)
+
                 if bit == "8:tc":
                     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.fc1) is not None, \
                         "Tensorcore is not available on this GPU, or the calibration data is not available"
