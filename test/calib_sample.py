@@ -15,7 +15,7 @@ if __name__ == '__main__':
     # sample text
     input_ids = tokenizer.encode("Hi, where is my dog", return_tensors="pt")
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained(f"facebook/opt-{model_size}", torch_dtype=torch.float32)
-    
+
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
     # caliber.default_hook = caliber.torch_int_forward_hook

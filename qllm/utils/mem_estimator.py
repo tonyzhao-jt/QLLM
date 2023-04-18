@@ -1,6 +1,6 @@
 from .unit_handler import convert_to_unit
 class ModelMemEstimator:
-    def __init__(self, h1, h2, b, s, n, vocab_size=None, max_position_embeddings=None) -> None:
+    def __init__(self, h1, h2, b, s, n, vocab_size=None, max_position_embeddings=None, word_embed_proj_dim=None) -> None:
         # Refer to the flexGEN
         # h1 hidden dimension
         # h2 hidden dimension of second mlp
@@ -15,6 +15,7 @@ class ModelMemEstimator:
         
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
+        self.word_embed_proj_dim = word_embed_proj_dim
     
     def calculate_prepost_mem(self, unit='b', bit=16):
         # contain token embedding and positional embedding. Positiona
@@ -23,10 +24,14 @@ class ModelMemEstimator:
             return 0
         # calculate each embedding size
         # 32 size
-        token_embedding_size = self.vocab_size * self.h1 * 4
+        token_embedding_size = self.vocab_size * self.word_embed_proj_dim * 4
         max_pos_embedding_size = self.max_position_embeddings * self.h1 * 4
+        # there exists a project_out / project_in for the max_pos_embedding if work_embed_proj_dim != h1
+        if self.word_embed_proj_dim != self.h1:
+            max_pos_embedding_size += 2 * self.h1 * self.word_embed_proj_dim * 4
+        # there could be project_in and out here.
         # lm_head
-        lm_head_weight_size = self.vocab_size * self.h1 * 4
+        lm_head_weight_size = self.vocab_size * self.word_embed_proj_dim * 4
         mem_b = token_embedding_size + max_pos_embedding_size + lm_head_weight_size
         mem_b = mem_b * bit / 32
         mem_b += self.calculate_single_layer_ln_weight() * bit / 16
@@ -49,6 +54,7 @@ class ModelMemEstimator:
         return self.calculate_single_selfattn_mem() + self.calculate_single_FFN_mem() 
     
     def calculate_single_layer_maximum_kv_cache(self):
+        # print(self.b, self.h1, (self.s + self.n))
         size = self.b * self.h1 * (self.s + self.n) * 2 * 2 #(k and v), store in fp16
         return size 
     
@@ -75,22 +81,21 @@ class ModelMemEstimator:
         for layer, config in partition.items():
             shard = config["shard"]
             bits = config["bits"]
-            
             if len(shard) != len(bits):
                 raise ValueError("shard and bits should have same length")
 
             for idx, value in enumerate(shard):
                 if value == 0:
                     # add the kv size
-                    kv_size = self.calculate_single_layer_maximum_kv_cache()
+                    kv_size = self.calculate_single_layer_maximum_kv_cache() # calculate in fp16
                     # bits
                     bit = bits[idx]
-                    if type(bit) != int:
+                    if bit == '8:tc': # only for tensorcore, we store the kv in INT8
                         bit = 8
-                        kv_size = kv_size * bit / 32 # the feature supported by pure int8
+                        kv_size = kv_size * bit / 16 # the feature supported by pure int8
                     all_size_estimation += kv_size 
         return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
-    
+
     def calculate_model_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format
         # {0: {"shard": [0,1], "bits": [8,8]}}

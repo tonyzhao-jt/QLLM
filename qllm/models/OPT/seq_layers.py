@@ -35,12 +35,17 @@ import copy
 
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
-from lptorch.utils import is_tensorcore_int8_available
+from lptorch.utils import is_tensorcore_int8_available, get_capability
 
-
-from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
-from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
-from lptorch.torch_int.nn.fused import LayerNormQ
+cap = get_capability()
+if cap >= 80:
+    from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+    from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+    from lptorch.torch_int.nn.fused import LayerNormQ
+else:
+    from lptorch.lptorch.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+    from lptorch.lptorch.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+    from lptorch.lptorch.nn.fused import LayerNormQ
 
 from accelerate import init_empty_weights
 
@@ -246,7 +251,6 @@ class Int8OPTAttention(nn.Module):
         attn_output = attn_output.reshape(
             bsz, tgt_len, self.embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
-
         return attn_output, attn_probs_reshaped, past_key_value
 
 class OPTAttentionSeq(nn.Module):
@@ -424,6 +428,7 @@ class OPTDecoderLayerSharded(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
         self.partitions = [0,1] # by default, contain both self attention and FFN
+        # prepare a forward tokenizer for ffn only quiantized case
 
     def set_partition(self, partitions):
         self.partitions = [i for i in partitions]
@@ -530,10 +535,10 @@ class OPTDecoderLayerSharded(nn.Module):
                     self.self_attn = Int8OPTAttention.from_float(
                         self.self_attn, attn_input_scale, q_output_scale, k_output_scale, v_output_scale, out_input_scale)
                     
-                    if self.do_layer_norm_before:
-                        self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
-                    else:
-                        self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, out_input_scale)
+                    # if self.do_layer_norm_before:
+                    #     self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
+                    self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
+                    # else remain fp16 layernorm
                 # TODO: for moment, we disable the torchint by passing none to caliber
                 elif bit == "8:tc-li":
                     bit = 8
@@ -543,6 +548,7 @@ class OPTDecoderLayerSharded(nn.Module):
                 
             elif partition == 1:
                 bit = bits[idx]
+                # case that only ffn exists, prepare a forward quantizer here
                 if not caliber.fake:
                     input_shape = caliber.get_module_input_shape(self.fc1)
                     self.test_input_shape['FFN'] = input_shape
@@ -577,13 +583,14 @@ class OPTDecoderLayerSharded(nn.Module):
                     # adaptive quantization for BITSANDBYTES and GPTQ
                     self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=None)
                     self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=None)
+                
 
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
         residual = hidden_states
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
+        # if self.do_layer_norm_before:
+        #     hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn_layer_norm(hidden_states)
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -596,8 +603,8 @@ class OPTDecoderLayerSharded(nn.Module):
         hidden_states = residual + hidden_states.to(residual.dtype)
 
         # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
+        # if not self.do_layer_norm_before:
+        #     hidden_states = self.self_attn_layer_norm(hidden_states)
         
         # use kv cache
         if use_cache:
@@ -608,17 +615,17 @@ class OPTDecoderLayerSharded(nn.Module):
         return outputs
     
     def FFN_PART(self, hidden_states:torch.Tensor):
-        # hidden_states = hidden_states 
-        # Fully Connected]
+        # input should be always fp16
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
         residual = hidden_states    
 
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            if isinstance(self.final_layer_norm, LayerNormQ):
-                hidden_states = hidden_states.to(torch.float32)
-            hidden_states = self.final_layer_norm(hidden_states)
+        # if self.do_layer_norm_before:
+        #     if isinstance(self.final_layer_norm, LayerNormQ):
+        #         hidden_states = hidden_states.to(torch.float32) # layernorm Q takes fp32
+        #     hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.final_layer_norm(hidden_states)
 
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
@@ -629,8 +636,8 @@ class OPTDecoderLayerSharded(nn.Module):
         hidden_states = (residual + hidden_states.to(residual.dtype)).view(hidden_states_shape)
 
         # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
+        # if not self.do_layer_norm_before:
+        #     hidden_states = self.final_layer_norm(hidden_states)
 
         outputs = (hidden_states,)
 
@@ -976,10 +983,11 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             if decoder_layer is None:
                 continue
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
+            past_key_value = None
             if decoder_layer.has_self_attention():
-                past_key_value = self.get_kv_cache(idx, request_id)
-            else:
-                past_key_value = None
+                if hasattr(self, 'kv_cache'):
+                    past_key_value = self.get_kv_cache(idx, request_id)
+
             # past_key_value = past_key_values[idx] if past_key_values is not None else None
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -992,10 +1000,11 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             if decoder_layer.has_self_attention(): # store the kv together with the selfattn
                 if use_cache:
                     # the output will contain a present key value
-                    if type(layer_outputs[1]) == tuple:
-                        self.update_kv_cache(idx, layer_outputs[1], request_id)
-                    else:
-                        self.update_kv_cache(idx, layer_outputs[1:], request_id) # update for further usage
+                    if hasattr(self, 'kv_cache'):
+                        if type(layer_outputs[1]) == tuple:
+                            self.update_kv_cache(idx, layer_outputs[1], request_id)
+                        else:
+                            self.update_kv_cache(idx, layer_outputs[1:], request_id) # update for further usage
 
             if decoder_layer.is_only_self_attention():
                 hidden_states = (layer_outputs[0], ) # 
