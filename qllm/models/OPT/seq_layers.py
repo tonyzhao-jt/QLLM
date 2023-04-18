@@ -593,7 +593,7 @@ class OPTDecoderLayerSharded(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states.to(residual.dtype)
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -608,23 +608,25 @@ class OPTDecoderLayerSharded(nn.Module):
         return outputs
     
     def FFN_PART(self, hidden_states:torch.Tensor):
-        hidden_states = hidden_states 
-        # Fully Connected
+        # hidden_states = hidden_states 
+        # Fully Connected]
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
-        residual = hidden_states
+        residual = hidden_states    
 
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
         if self.do_layer_norm_before:
+            if isinstance(self.final_layer_norm, LayerNormQ):
+                hidden_states = hidden_states.to(torch.float32)
             hidden_states = self.final_layer_norm(hidden_states)
 
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
         hidden_states = self.fc2(hidden_states)
+        # no drop out for inference
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-
-        hidden_states = (residual + hidden_states).view(hidden_states_shape)
+        hidden_states = (residual + hidden_states.to(residual.dtype)).view(hidden_states_shape)
 
         # 350m applies layer norm AFTER attention
         if not self.do_layer_norm_before:
@@ -867,6 +869,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
                 self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
                 print("create layer:", layer_idx)
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
+            self.layers.eval() # use eval mode
             # directly move to device
             if device is not None:
                 self.layers[layer_idx] = self.layers[layer_idx].to(device)

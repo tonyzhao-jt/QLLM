@@ -26,10 +26,10 @@ if __name__ == '__main__':
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained(f"facebook/opt-{model_size}", torch_dtype=torch.float16)
     sharding_strategy = {
         0: {
-            0: {'shard': [0, 1], 'bits': [16, 16]},
+            0: {'shard': [0, 1], 'bits': ['8:tc', '8:tc']},
             1: {'shard': [0, 1], 'bits': [16, 16]},
             2: {'shard': [0, 1], 'bits': [16, 16]},
-            3: {'shard': [0, 1], 'bits': [16, 16]},
+            3: {'shard': [0, 1], 'bits': ['8:tc', 16]},
             4: {'shard': [0, 1], 'bits': [16, 16]},
             5: {'shard': [0, 1], 'bits': [16, 16]},
             6: {'shard': [0], 'bits': [16]},
