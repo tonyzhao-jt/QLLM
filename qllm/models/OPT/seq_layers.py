@@ -177,10 +177,11 @@ class Int8OPTAttention(nn.Module):
         # import pdb; pdb.set_trace()
         # the bmm can only done in fp16. requires strict alginment and padding
         # attn_weights = self.qk_bmm(query_states, key_states)
-        if src_len % 16:
-            attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
-        else:
-            attn_weights = self.qk_bmm(query_states, key_states)
+        attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
+        # if src_len % 16:
+        #     attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
+        # else:
+        #     attn_weights = self.qk_bmm(query_states, key_states)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -226,15 +227,16 @@ class Int8OPTAttention(nn.Module):
             attn_probs_reshaped = None
 
         # (A_row V_row)_row = (A_row V_col ^T)_row
-
-        if src_len % 16:
-            attn_output = torch.bmm(attn_probs.half(), value_states.half())
-            attn_output = attn_output.to(torch.int8)
-        else:
-            attn_probs.mul_(127).round_()
-            attn_probs = attn_probs.to(torch.int8)
-            value_states = value_states.transpose(1, 2).contiguous()
-            attn_output = self.pv_bmm(attn_probs, value_states)
+        attn_output = torch.bmm(attn_probs.half(), value_states.half())
+        attn_output = attn_output.to(torch.int8)
+        # if src_len % 16:
+        #     attn_output = torch.bmm(attn_probs.half(), value_states.half())
+        #     attn_output = attn_output.to(torch.int8)
+        # else:
+        #     attn_probs.mul_(127).round_()
+        #     attn_probs = attn_probs.to(torch.int8)
+        #     value_states = value_states.transpose(1, 2).contiguous()
+        #     attn_output = self.pv_bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
