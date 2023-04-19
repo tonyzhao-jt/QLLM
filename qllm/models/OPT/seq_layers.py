@@ -878,7 +878,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
                 self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
                 print("create layer:", layer_idx)
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
-            self.layers.eval() # use eval mode
+            self.layers[layer_idx].eval() # use eval mode
             # directly move to device
             if device is not None:
                 self.layers[layer_idx] = self.layers[layer_idx].to(device)

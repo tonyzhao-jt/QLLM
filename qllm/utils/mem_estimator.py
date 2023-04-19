@@ -95,6 +95,64 @@ class ModelMemEstimator:
                         kv_size = kv_size * bit / 16 # the feature supported by pure int8
                     all_size_estimation += kv_size 
         return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
+    
+    def calculate_temp_embedding_tensor_size(self, unit='b'):
+        all = self.b * self.s * (3 * self.h1 + 2 * self.word_embed_proj_dim)
+        return convert_to_unit(all, unit), f'{convert_to_unit(all, unit)} {unit}'
+    
+    def calculate_temp_tensor_size_prefill(self, unit='b'):
+        # a layer norm
+        attn_ln_tmp_size = self.b * self.s * self.h1 * 2 # by default to 16
+        # 3QKV + 1 proj
+        qkv_tmp_size = 4 * self.b * self.s * self.h1 * 2 # by default to 16
+        # softmax, 32 bit
+        softmax_tmp_size = self.b * self.s * self.h1 * 4 # by default to 16
+        # 2 BMM (for qk_bmm, there is a softmax)
+        bmm_tmp_size = (self.b * self.s * self.s + self.b * self.s * self.h1) * 2 # by default to 16
+        # tmp buffer for kv cache
+        kv_cache_tmp = 0
+        # ffn
+        # a layer norm
+        ffn_ln_tmp_size = self.b * self.s * self.h1 * 2 # by default to 16
+        # activation
+        activation_tmp_size = self.b * self.s * self.h2 * 2 # by default to 16
+        # fc1 and fc2
+        fc_tmp_size = self.b * self.s * (self.h1 + self.h2) * 2 # by default to 16
+        # total
+        total_tmp_size = attn_ln_tmp_size + qkv_tmp_size + bmm_tmp_size + kv_cache_tmp + softmax_tmp_size + \
+              ffn_ln_tmp_size + activation_tmp_size + fc_tmp_size 
+        return convert_to_unit(total_tmp_size, unit), f'{convert_to_unit(total_tmp_size, unit)} {unit}'
+    
+    def calculate_temp_tensor_size_next_i(self, unit='b'):
+        # attn
+        # a layer norm
+        attn_ln_tmp_size = self.b * self.h1 * 2 # by default to 16
+        # 3QKV + 1 proj
+        qkv_tmp_size = 4 * self.b * self.h1 * 2 # by default to 16
+        # 2 BMM (for qk_bmm, there is a softmax)
+        bmm_tmp_size = (self.b * (self.s + self.n) + self.b * self.h1) * 2 # by default to 16
+        # 32
+        softmax_tmp_size = self.b * (self.s + self.n) * 4
+        # tmp buffer for kv cache
+        kv_cache_tmp = 2 * (self.b * (self.s + self.n) * self.h1) * 2 # by default to 16
+        # ffn
+        # a layer norm
+        ffn_ln_tmp_size = self.b * self.h1 * 2 # by default to 16
+        # activation
+        activation_tmp_size = self.b * self.h2 * 2 # by default to 16
+        # fc1 and fc2
+        fc_tmp_size = self.b * (self.h1 + self.h2) * 2 # by default to 16
+        # total
+        total_tmp_size = attn_ln_tmp_size + qkv_tmp_size + bmm_tmp_size + kv_cache_tmp + softmax_tmp_size + \
+              ffn_ln_tmp_size + activation_tmp_size + fc_tmp_size 
+        return convert_to_unit(total_tmp_size, unit), f'{convert_to_unit(total_tmp_size, unit)} {unit}'
+
+    # return in bytes
+    def calculate_temp_tensor_size(self, unit='b'):
+        max_temp = max(self.calculate_temp_tensor_size_prefill(unit)[0], \
+                       self.calculate_temp_tensor_size_next_i(unit)[0], \
+                        self.calculate_temp_embedding_tensor_size(unit)[0])
+        return max_temp, f'{max_temp} {unit}'
 
     def calculate_model_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format
@@ -125,6 +183,8 @@ class ModelMemEstimator:
                     ffn_mem = ffn_mem * bit / 32
                     all_size_estimation += ffn_mem
         return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
+
+    
 
     def calculate_maximum_mem_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format
