@@ -178,6 +178,7 @@ class Int8OPTAttention(nn.Module):
         # the bmm can only done in fp16. requires strict alginment and padding
         # attn_weights = self.qk_bmm(query_states, key_states)
         attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
+        value_states = value_states.half()
         # if src_len % 16:
         #     attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
         # else:
@@ -200,8 +201,12 @@ class Int8OPTAttention(nn.Module):
                 torch.finfo(attn_weights.dtype).min))
             attn_weights = attn_weights.view(
                 bsz * self.num_heads, tgt_len, src_len)
-
-        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        
+        # attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        if attn_weights.dtype == torch.float16:
+            attn_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+        else:
+            attn_probs = nn.functional.softmax(attn_weights, dim=-1)
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -227,8 +232,11 @@ class Int8OPTAttention(nn.Module):
             attn_probs_reshaped = None
 
         # (A_row V_row)_row = (A_row V_col ^T)_row
-        attn_output = torch.bmm(attn_probs.half(), value_states.half())
+        attn_output = torch.bmm(attn_probs, value_states) # here the value is in fp16
+        # round the value into the int8 range
+        attn_output.clamp_(-127, 127).round_()
         attn_output = attn_output.to(torch.int8)
+
         # if src_len % 16:
         #     attn_output = torch.bmm(attn_probs.half(), value_states.half())
         #     attn_output = attn_output.to(torch.int8)
@@ -288,6 +296,7 @@ class OPTAttentionSeq(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -437,12 +446,13 @@ class OPTDecoderLayerSharded(nn.Module):
     
     def is_only_self_attention(self):
         return self.partitions == [0]
-
+    
     def has_self_attention(self):
         return 0 in self.partitions
 
     # FOR CUTLASS (tensorcore), it may not be available to run on all GPUs.
     # Need to verify whether it is available on the current GPU.
+    @torch.no_grad()
     def verify_kernel(self):
         test_result = []
         self_attn_fake_bits, ffn_fake_bits = 16, 16
@@ -483,6 +493,7 @@ class OPTDecoderLayerSharded(nn.Module):
         
         return test_result
     
+    @torch.no_grad()
     def shard(self, shard_strategy):
         self.set_partition(shard_strategy.get('shard', []))
         bits = shard_strategy.get('bits', [])
@@ -586,7 +597,7 @@ class OPTDecoderLayerSharded(nn.Module):
                     self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=None)
                     self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=None)
                 
-
+    @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
         residual = hidden_states
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
@@ -616,6 +627,7 @@ class OPTDecoderLayerSharded(nn.Module):
 
         return outputs
     
+    @torch.no_grad()
     def FFN_PART(self, hidden_states:torch.Tensor):
         # input should be always fp16
         hidden_states_shape = hidden_states.shape
@@ -645,6 +657,7 @@ class OPTDecoderLayerSharded(nn.Module):
 
         return outputs
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -739,6 +752,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         self.embed_tokens = value
 
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
+    @torch.no_grad()
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
         # create causal mask
         # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -762,7 +776,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
 
         return combined_attention_mask
             
-    
+    @torch.no_grad()
     def forward_pre(self, 
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -838,6 +852,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             "next_decoder_cache": next_decoder_cache,
         }
 
+    @torch.no_grad()
     def forward_post(self, hidden_states, next_decoder_cache=None, use_cache=False, return_dict=False):
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
@@ -864,6 +879,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
                 return param.is_meta
 
     # inplace sharding
+    @torch.no_grad()
     def _shard_decoders(self, sharding_strategy, device=None):
         layer_idxs = list(sharding_strategy.keys())
         for i in range(self.get_decoder_layer_num()):
@@ -876,7 +892,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             layer = self.layers[layer_idx]
             if layer is None:
                 self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
-                print("create layer:", layer_idx)
+                print("create layer:", layer_idx, end="|")
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
             self.layers[layer_idx].eval() # use eval mode
             # directly move to device
@@ -889,7 +905,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         #     if layer is not None:
         #         layer.load_weight()
 
-    
+    @torch.no_grad()
     def verify_decoder_layers(self):
         for layer in self.layers:
             if layer is not None:
@@ -902,6 +918,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         del self.project_in
         del self.project_out
     
+    @torch.no_grad()
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
         if not hasattr(self, 'kv_cache'):
             self.kv_cache = {}
@@ -930,6 +947,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
                 prompt_length
             ]
     
+    @torch.no_grad()
     def update_kv_cache(self, layer_idx, key_value_pair, request_id):
         if not hasattr(self, 'kv_cache'):
             assert False, "kv_cache not initialized"
@@ -940,7 +958,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         self.kv_cache[layer_idx][request_id][1][:, :, :self.kv_cache[layer_idx][request_id][2] + \
                                                     self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[1])
 
-
+    @torch.no_grad()
     def get_kv_cache(self, layer_idx, request_id):
         if not hasattr(self, 'kv_cache'):
             assert False, "kv_cache not initialized"
@@ -959,6 +977,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
     def verbose_kv_cache(self):
         print(self.kv_cache)
     
+    @torch.no_grad()
     def clear_request_kv_cache(self, request_id=1):
         for layer_idx in self.kv_cache:
             if request_id in self.kv_cache[layer_idx]:
@@ -968,6 +987,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         self.kv_cache = {}
 
     # only remains inference related part
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.LongTensor = None,
@@ -978,12 +998,12 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         next_decoder_cache: Optional[List[torch.FloatTensor]] = None,
         request_id: Optional[int] = 1,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        
         mask_and_cache = (attention_mask, head_mask, use_cache) 
         
         for idx, decoder_layer in enumerate(self.layers):
             if decoder_layer is None:
                 continue
+            print("inf on layer idx: ", idx)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             past_key_value = None
             if decoder_layer.has_self_attention():
@@ -1027,6 +1047,7 @@ class OPTModelSeq(OPTModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1079,6 +1100,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
+    @torch.no_grad()
     def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1):
         with torch.no_grad():
             input_ids_seq_length = new_input_ids.shape[1] - 1
@@ -1100,7 +1122,8 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             next_token_embeds = next_token_embeds + p_embeds
             request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
             return request_token
-
+    
+    @torch.no_grad()
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
                    use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1, \
                     past_key_values_length: int = 0, **kwargs):
@@ -1135,6 +1158,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         return pre_result
     
     # model sharders
+    @torch.no_grad()
     def _verify_shard_strategy(self, shard_strategies):
         all_decode_ids = set()
         for idx, shard_strategy in shard_strategies.items():
@@ -1142,12 +1166,14 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             all_decode_ids = all_decode_ids.union(decode_ids)
         assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
     
+    @torch.no_grad()
     def _shard_model_current(self, shard_strategy, device=None):
         self.model.decoder._shard_decoders(shard_strategy, device)
         self.model.decoder._delete_all_other_modules()
         del self.lm_head
 
     # inplace sharding
+    @torch.no_grad()
     def _shard_model(self, shard_strategies, shard_idx):
         self.is_master = True if shard_idx == 0 else False
         if self.is_master:
@@ -1155,73 +1181,79 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         current_shard_strategy = shard_strategies[shard_idx]
         self._shard_model_current(current_shard_strategy)
     
+    @torch.no_grad()
     def _pure_pre_and_post(self):
         sharded_model = copy.deepcopy(self)
         sharded_model.model.decoder._shard_decoders({}) # didn't delete the embeddings, etc.
         return sharded_model
 
     # return model instance with copy
+    @torch.no_grad()
     def shard_model(self, shard_strategies, shard_idx):
         # copy a model
         sharded_model = copy.deepcopy(self)
         sharded_model._shard_model(shard_strategies, shard_idx)
         return sharded_model
     
+    @torch.no_grad()
     def decoder_layers_to_device(self, device):
         self.model.decoder.layers = self.model.decoder.layers.to(device)
 
     # rewrite the forward function
+    @torch.no_grad()
     def decode(self, pre_result):
-        with torch.no_grad():
-            def shard_launcher(prev_result, module_shard):
-                # length_prev_result = len(prev_result)
-                hidden_states = prev_result[0]
-                attention_mask, head_mask, use_cache, request_id = prev_result[1:]
-                return module_shard(
-                    hidden_states=hidden_states,
-                    next_decoder_cache=None,
-                    attention_mask=attention_mask,
-                    head_mask=head_mask,
-                    past_key_values=None,
-                    use_cache=use_cache,
-                    request_id=request_id,
-                )
+        def shard_launcher(prev_result, module_shard):
+            # length_prev_result = len(prev_result)
+            hidden_states = prev_result[0]
+            attention_mask, head_mask, use_cache, request_id = prev_result[1:]
+            res = module_shard(
+                hidden_states=hidden_states,
+                next_decoder_cache=None,
+                attention_mask=attention_mask,
+                head_mask=head_mask,
+                past_key_values=None,
+                use_cache=use_cache,
+                request_id=request_id,
+            )
+            return res
 
-            return shard_launcher(pre_result, self.model.decoder)
+        return shard_launcher(pre_result, self.model.decoder)
 
+    @torch.no_grad()
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
         return self.model.decoder.init_kv_cache(b, prompt_length, token_to_generate, request_id)
     
+    @torch.no_grad()
     def postprocess(self, results, labels=None):
-        with torch.no_grad():
-            # head_mask, attention_mask should be passed with the pre_result
-            # past_key_value should be stored within the model
-            return_dict = self.return_dict
-            hidden_states, attention_mask, head_mask, use_cache, request_id = results
-            next_decoder_cache = None
-            outputs = self.model.decoder.forward_post(
-                hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict
-            )
-            logits = self.lm_head(outputs[0]).contiguous()
-            loss = None
-            if labels is not None:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss_fct = CrossEntropyLoss()
-                loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
+        # head_mask, attention_mask should be passed with the pre_result
+        # past_key_value should be stored within the model
+        return_dict = self.return_dict
+        hidden_states, attention_mask, head_mask, use_cache, request_id = results
+        next_decoder_cache = None
+        outputs = self.model.decoder.forward_post(
+            hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict
+        )
+        logits = self.lm_head(outputs[0]).contiguous()
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
 
-            if not return_dict:
-                output = (logits,) + outputs[1:]
-                return (loss,) + output if loss is not None else output
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
 
-            return CausalLMOutputWithPast(
-                loss=loss,
-                logits=logits,
-                past_key_values=outputs.past_key_values,
-                hidden_states=outputs.hidden_states,
-                attentions=outputs.attentions,
-            )
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
+    @torch.no_grad()
     def forward(
             self,
             input_ids: torch.LongTensor = None,
