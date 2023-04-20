@@ -7,14 +7,14 @@ from transformers import (
 
 # according to its original paper: https://arxiv.org/pdf/2205.01068.pdf
 model_cards = {
-    '125M': OPTConfig(
+    '125m': OPTConfig(
         hidden_size=768,
         ffn_dim=3072,
         word_embed_proj_dim=768,
         num_attention_heads=12,
         num_hidden_layers=24,
     ),
-    '350M': OPTConfig(
+    '350m': OPTConfig(
         hidden_size=1024,
         ffn_dim=4096,
         word_embed_proj_dim=512,

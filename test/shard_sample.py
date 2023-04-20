@@ -97,6 +97,9 @@ if __name__ == '__main__':
     # becareful to use this one
     input_ids = input_ids.cuda()
 
+    for k_model in model_packs:
+        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
+
     # eval mode
     # model.eval()
     # model_2.eval()
@@ -133,6 +136,7 @@ if __name__ == '__main__':
     print(h1, h2)
     model_mem_estimator = ModelMemEstimator(h1, h2, b, s, n)
     # print model 1, 2, 3 size in MB
+    print("Model pre and post size: ", get_model_size_cuda(model_pre_and_post, 'MB'))
     print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))

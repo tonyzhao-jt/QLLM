@@ -1,6 +1,6 @@
 from .unit_handler import convert_to_unit
 class ModelMemEstimator:
-    def __init__(self, h1, h2, b, s, n) -> None:
+    def __init__(self, h1, h2, b, s, n, vocab_size=None, max_position_embeddings=None, word_embed_proj_dim=None) -> None:
         # Refer to the flexGEN
         # h1 hidden dimension
         # h2 hidden dimension of second mlp
@@ -12,8 +12,30 @@ class ModelMemEstimator:
         self.b = b
         self.s = s
         self.n = n
-        pass
-
+        
+        self.vocab_size = vocab_size
+        self.max_position_embeddings = max_position_embeddings
+        self.word_embed_proj_dim = word_embed_proj_dim
+    
+    def calculate_prepost_mem(self, unit='b', bit=16):
+        # contain token embedding and positional embedding. Positiona
+        if self.vocab_size is None:
+            print("Token embedding dim is not specified")
+            return 0
+        # calculate each embedding size
+        # 32 size
+        token_embedding_size = self.vocab_size * self.word_embed_proj_dim * 4
+        max_pos_embedding_size = self.max_position_embeddings * self.h1 * 4
+        # there exists a project_out / project_in for the max_pos_embedding if work_embed_proj_dim != h1
+        if self.word_embed_proj_dim != self.h1:
+            max_pos_embedding_size += 2 * self.h1 * self.word_embed_proj_dim * 4
+        # there could be project_in and out here.
+        # lm_head
+        lm_head_weight_size = self.vocab_size * self.word_embed_proj_dim * 4
+        mem_b = token_embedding_size + max_pos_embedding_size + lm_head_weight_size
+        mem_b = mem_b * bit / 32
+        mem_b += self.calculate_single_layer_ln_weight() * bit / 16
+        return convert_to_unit(mem_b, unit), f"{convert_to_unit(mem_b, unit)} {unit}"
     
     def calculate_single_selfattn_mem(self):
         # QKV storage + OUT projection, 4 linear
@@ -32,6 +54,7 @@ class ModelMemEstimator:
         return self.calculate_single_selfattn_mem() + self.calculate_single_FFN_mem() 
     
     def calculate_single_layer_maximum_kv_cache(self):
+        # print(self.b, self.h1, (self.s + self.n))
         size = self.b * self.h1 * (self.s + self.n) * 2 * 2 #(k and v), store in fp16
         return size 
     
@@ -58,22 +81,79 @@ class ModelMemEstimator:
         for layer, config in partition.items():
             shard = config["shard"]
             bits = config["bits"]
-            
             if len(shard) != len(bits):
                 raise ValueError("shard and bits should have same length")
 
             for idx, value in enumerate(shard):
                 if value == 0:
                     # add the kv size
-                    kv_size = self.calculate_single_layer_maximum_kv_cache()
+                    kv_size = self.calculate_single_layer_maximum_kv_cache() # calculate in fp16
                     # bits
                     bit = bits[idx]
-                    if type(bit) != int:
+                    if bit == '8:tc': # only for tensorcore, we store the kv in INT8
                         bit = 8
-                        kv_size = kv_size * bit / 32 # the feature supported by pure int8
+                        kv_size = kv_size * bit / 16 # the feature supported by pure int8
                     all_size_estimation += kv_size 
         return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
     
+    def calculate_temp_embedding_tensor_size(self, unit='b'):
+        all = self.b * self.s * (3 * self.h1 + 2 * self.word_embed_proj_dim)
+        return convert_to_unit(all, unit), f'{convert_to_unit(all, unit)} {unit}'
+    
+    def calculate_temp_tensor_size_prefill(self, unit='b'):
+        # a layer norm
+        attn_ln_tmp_size = self.b * self.s * self.h1 * 2 # by default to 16
+        # 3QKV + 1 proj
+        qkv_tmp_size = 4 * self.b * self.s * self.h1 * 2 # by default to 16
+        # softmax, 32 bit
+        softmax_tmp_size = self.b * self.s * self.h1 * 4 # by default to 16
+        # 2 BMM (for qk_bmm, there is a softmax)
+        bmm_tmp_size = (self.b * self.s * self.s + self.b * self.s * self.h1) * 2 # by default to 16
+        # tmp buffer for kv cache
+        kv_cache_tmp = 0
+        # ffn
+        # a layer norm
+        ffn_ln_tmp_size = self.b * self.s * self.h1 * 2 # by default to 16
+        # activation
+        activation_tmp_size = self.b * self.s * self.h2 * 2 # by default to 16
+        # fc1 and fc2
+        fc_tmp_size = self.b * self.s * (self.h1 + self.h2) * 2 # by default to 16
+        # total
+        total_tmp_size = attn_ln_tmp_size + qkv_tmp_size + bmm_tmp_size + kv_cache_tmp + softmax_tmp_size + \
+              ffn_ln_tmp_size + activation_tmp_size + fc_tmp_size 
+        return convert_to_unit(total_tmp_size, unit), f'{convert_to_unit(total_tmp_size, unit)} {unit}'
+    
+    def calculate_temp_tensor_size_next_i(self, unit='b'):
+        # attn
+        # a layer norm
+        attn_ln_tmp_size = self.b * self.h1 * 2 # by default to 16
+        # 3QKV + 1 proj
+        qkv_tmp_size = 4 * self.b * self.h1 * 2 # by default to 16
+        # 2 BMM (for qk_bmm, there is a softmax)
+        bmm_tmp_size = (self.b * (self.s + self.n) + self.b * self.h1) * 2 # by default to 16
+        # 32
+        softmax_tmp_size = self.b * (self.s + self.n) * 4
+        # tmp buffer for kv cache
+        kv_cache_tmp = 2 * (self.b * (self.s + self.n) * self.h1) * 2 # by default to 16
+        # ffn
+        # a layer norm
+        ffn_ln_tmp_size = self.b * self.h1 * 2 # by default to 16
+        # activation
+        activation_tmp_size = self.b * self.h2 * 2 # by default to 16
+        # fc1 and fc2
+        fc_tmp_size = self.b * (self.h1 + self.h2) * 2 # by default to 16
+        # total
+        total_tmp_size = attn_ln_tmp_size + qkv_tmp_size + bmm_tmp_size + kv_cache_tmp + softmax_tmp_size + \
+              ffn_ln_tmp_size + activation_tmp_size + fc_tmp_size 
+        return convert_to_unit(total_tmp_size, unit), f'{convert_to_unit(total_tmp_size, unit)} {unit}'
+
+    # return in bytes
+    def calculate_temp_tensor_size(self, unit='b'):
+        max_temp = max(self.calculate_temp_tensor_size_prefill(unit)[0], \
+                       self.calculate_temp_tensor_size_next_i(unit)[0], \
+                        self.calculate_temp_embedding_tensor_size(unit)[0])
+        return max_temp, f'{max_temp} {unit}'
+
     def calculate_model_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format
         # {0: {"shard": [0,1], "bits": [8,8]}}
@@ -103,6 +183,8 @@ class ModelMemEstimator:
                     ffn_mem = ffn_mem * bit / 32
                     all_size_estimation += ffn_mem
         return convert_to_unit(all_size_estimation, unit), f'{convert_to_unit(all_size_estimation, unit)} {unit}'
+
+    
 
     def calculate_maximum_mem_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format

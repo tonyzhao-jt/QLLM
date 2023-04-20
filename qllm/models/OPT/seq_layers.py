@@ -15,12 +15,13 @@ from transformers.models.opt.modeling_opt import (
     OPTLearnedPositionalEmbedding,
     OPTModel,
     OPTDecoder,
+    OPTPreTrainedModel,
+    _make_causal_mask, _expand_mask
 )
 # output decorator
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
-    ModelOutput
 )
 
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
@@ -29,18 +30,24 @@ from transformers.activations import ACT2FN
 logger = logging.get_logger(__name__)
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-import random
 from dataclasses import dataclass
 import copy
 
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
-from lptorch.utils import is_tensorcore_int8_available
+from lptorch.utils import is_tensorcore_int8_available, get_capability
 
+cap = get_capability()
+if cap >= 80:
+    from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+    from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+    from lptorch.torch_int.nn.fused import LayerNormQ
+else:
+    from lptorch.lptorch.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+    from lptorch.lptorch.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+    from lptorch.lptorch.nn.fused import LayerNormQ
 
-from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
-from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
-from lptorch.torch_int.nn.fused import LayerNormQ
+from accelerate import init_empty_weights
 
 class Int8OPTAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -170,10 +177,12 @@ class Int8OPTAttention(nn.Module):
         # import pdb; pdb.set_trace()
         # the bmm can only done in fp16. requires strict alginment and padding
         # attn_weights = self.qk_bmm(query_states, key_states)
-        if src_len % 16:
-            attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
-        else:
-            attn_weights = self.qk_bmm(query_states, key_states)
+        attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
+        value_states = value_states.half()
+        # if src_len % 16:
+        #     attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
+        # else:
+        #     attn_weights = self.qk_bmm(query_states, key_states)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -192,8 +201,12 @@ class Int8OPTAttention(nn.Module):
                 torch.finfo(attn_weights.dtype).min))
             attn_weights = attn_weights.view(
                 bsz * self.num_heads, tgt_len, src_len)
-
-        attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        
+        # attn_probs = nn.functional.softmax(attn_weights, dim=-1)
+        if attn_weights.dtype == torch.float16:
+            attn_probs = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
+        else:
+            attn_probs = nn.functional.softmax(attn_weights, dim=-1)
 
         if layer_head_mask is not None:
             if layer_head_mask.size() != (self.num_heads,):
@@ -219,15 +232,19 @@ class Int8OPTAttention(nn.Module):
             attn_probs_reshaped = None
 
         # (A_row V_row)_row = (A_row V_col ^T)_row
+        attn_output = torch.bmm(attn_probs, value_states) # here the value is in fp16
+        # round the value into the int8 range
+        attn_output.clamp_(-127, 127).round_()
+        attn_output = attn_output.to(torch.int8)
 
-        if src_len % 16:
-            attn_output = torch.bmm(attn_probs.half(), value_states.half())
-            attn_output = attn_output.to(torch.int8)
-        else:
-            attn_probs.mul_(127).round_()
-            attn_probs = attn_probs.to(torch.int8)
-            value_states = value_states.transpose(1, 2).contiguous()
-            attn_output = self.pv_bmm(attn_probs, value_states)
+        # if src_len % 16:
+        #     attn_output = torch.bmm(attn_probs.half(), value_states.half())
+        #     attn_output = attn_output.to(torch.int8)
+        # else:
+        #     attn_probs.mul_(127).round_()
+        #     attn_probs = attn_probs.to(torch.int8)
+        #     value_states = value_states.transpose(1, 2).contiguous()
+        #     attn_output = self.pv_bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -244,7 +261,6 @@ class Int8OPTAttention(nn.Module):
         attn_output = attn_output.reshape(
             bsz, tgt_len, self.embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
-
         return attn_output, attn_probs_reshaped, past_key_value
 
 class OPTAttentionSeq(nn.Module):
@@ -280,6 +296,7 @@ class OPTAttentionSeq(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -422,18 +439,20 @@ class OPTDecoderLayerSharded(nn.Module):
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
         self.partitions = [0,1] # by default, contain both self attention and FFN
+        # prepare a forward tokenizer for ffn only quiantized case
 
     def set_partition(self, partitions):
         self.partitions = [i for i in partitions]
     
     def is_only_self_attention(self):
         return self.partitions == [0]
-
+    
     def has_self_attention(self):
         return 0 in self.partitions
 
     # FOR CUTLASS (tensorcore), it may not be available to run on all GPUs.
     # Need to verify whether it is available on the current GPU.
+    @torch.no_grad()
     def verify_kernel(self):
         test_result = []
         self_attn_fake_bits, ffn_fake_bits = 16, 16
@@ -474,6 +493,7 @@ class OPTDecoderLayerSharded(nn.Module):
         
         return test_result
     
+    @torch.no_grad()
     def shard(self, shard_strategy):
         self.set_partition(shard_strategy.get('shard', []))
         bits = shard_strategy.get('bits', [])
@@ -496,8 +516,28 @@ class OPTDecoderLayerSharded(nn.Module):
             if partition == 0:
                 # deal with quantization here.
                 bit = bits[idx]
-                input_shape = caliber.get_module_input_shape(self.self_attn.q_proj)
-                self.test_input_shape['self_attn'] = input_shape
+                if not caliber.fake:
+                    input_shape = caliber.get_module_input_shape(self.self_attn.q_proj)
+                    self.test_input_shape['self_attn'] = input_shape
+                else:
+                    for k, v in caliber.named_fake_input_shape.items():
+                        if 'self_attn' in k:
+                            if 'q_proj' in k:
+                                self.test_input_shape['self_attn'] = v
+                            fake_calib_data = caliber.named_fake_calib_data[k]
+                            if 'q_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.q_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.q_proj, fake_calib_data)
+                            elif 'k_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.k_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.k_proj, fake_calib_data)
+                            elif 'v_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.v_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.v_proj, fake_calib_data)
+                            elif 'out_proj' in k:
+                                unique_id = caliber.man_set_unique_id(self.self_attn.out_proj)
+                                caliber.man_set_module_calib_data(self.self_attn.out_proj, fake_calib_data)
+
                 if bit == "8:tc": # tensorcore int8
                     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attn.q_proj) is not None, \
                         "Tensorcore is not available on this GPU, or the calibration data is not available"
@@ -508,10 +548,10 @@ class OPTDecoderLayerSharded(nn.Module):
                     self.self_attn = Int8OPTAttention.from_float(
                         self.self_attn, attn_input_scale, q_output_scale, k_output_scale, v_output_scale, out_input_scale)
                     
-                    if self.do_layer_norm_before:
-                        self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
-                    else:
-                        self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, out_input_scale)
+                    # if self.do_layer_norm_before:
+                    #     self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
+                    self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
+                    # else remain fp16 layernorm
                 # TODO: for moment, we disable the torchint by passing none to caliber
                 elif bit == "8:tc-li":
                     bit = 8
@@ -521,8 +561,22 @@ class OPTDecoderLayerSharded(nn.Module):
                 
             elif partition == 1:
                 bit = bits[idx]
-                input_shape = caliber.get_module_input_shape(self.fc1)
-                self.test_input_shape['FFN'] = input_shape
+                # case that only ffn exists, prepare a forward quantizer here
+                if not caliber.fake:
+                    input_shape = caliber.get_module_input_shape(self.fc1)
+                    self.test_input_shape['FFN'] = input_shape
+                else:
+                    for k, v in caliber.named_fake_input_shape.items():
+                        if 'fc1' in k:
+                            self.test_input_shape['FFN'] = v
+                            fake_calib_data = caliber.named_fake_calib_data[k]
+                            unique_id = caliber.man_set_unique_id(self.fc1)
+                            caliber.man_set_module_calib_data(self.fc1, fake_calib_data)
+                        elif 'fc2' in k:
+                            fake_calib_data = caliber.named_fake_calib_data[k]
+                            unique_id = caliber.man_set_unique_id(self.fc2)
+                            caliber.man_set_module_calib_data(self.fc2, fake_calib_data)
+
                 if bit == "8:tc":
                     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.fc1) is not None, \
                         "Tensorcore is not available on this GPU, or the calibration data is not available"
@@ -542,13 +596,14 @@ class OPTDecoderLayerSharded(nn.Module):
                     # adaptive quantization for BITSANDBYTES and GPTQ
                     self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=None)
                     self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=None)
-
+                
+    @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, past_key_value, layer_head_mask, output_attentions=False, use_cache=False):
         residual = hidden_states
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
-
+        # if self.do_layer_norm_before:
+        #     hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn_layer_norm(hidden_states)
         # Self Attention
         hidden_states, self_attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states,
@@ -558,11 +613,11 @@ class OPTDecoderLayerSharded(nn.Module):
             output_attentions=output_attentions,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-        hidden_states = residual + hidden_states
+        hidden_states = residual + hidden_states.to(residual.dtype)
 
         # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.self_attn_layer_norm(hidden_states)
+        # if not self.do_layer_norm_before:
+        #     hidden_states = self.self_attn_layer_norm(hidden_states)
         
         # use kv cache
         if use_cache:
@@ -572,33 +627,37 @@ class OPTDecoderLayerSharded(nn.Module):
 
         return outputs
     
+    @torch.no_grad()
     def FFN_PART(self, hidden_states:torch.Tensor):
-        hidden_states = hidden_states 
-        # Fully Connected
+        # input should be always fp16
         hidden_states_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
-        residual = hidden_states
+        residual = hidden_states    
 
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        if self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
+        # if self.do_layer_norm_before:
+        #     if isinstance(self.final_layer_norm, LayerNormQ):
+        #         hidden_states = hidden_states.to(torch.float32) # layernorm Q takes fp32
+        #     hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.final_layer_norm(hidden_states)
 
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
         hidden_states = self.fc2(hidden_states)
+        # no drop out for inference
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
-
-        hidden_states = (residual + hidden_states).view(hidden_states_shape)
+        hidden_states = (residual + hidden_states.to(residual.dtype)).view(hidden_states_shape)
 
         # 350m applies layer norm AFTER attention
-        if not self.do_layer_norm_before:
-            hidden_states = self.final_layer_norm(hidden_states)
+        # if not self.do_layer_norm_before:
+        #     hidden_states = self.final_layer_norm(hidden_states)
 
         outputs = (hidden_states,)
 
         return outputs
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -641,21 +700,83 @@ class OPTDecoderLayerSharded(nn.Module):
             return outputs
         raise ValueError("No partition is specified")
 
-class OPTDecoderSeq(OPTDecoder):
+class OPTDecoderSeq(OPTPreTrainedModel):
     def __init__(self, config: OPTConfig):
         super().__init__(config)
+        self.dropout = config.dropout
+        self.layerdrop = config.layerdrop
+        self.padding_idx = config.pad_token_id
+        self.max_target_positions = config.max_position_embeddings
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.word_embed_proj_dim, self.padding_idx)
+        self.embed_positions = OPTLearnedPositionalEmbedding(config.max_position_embeddings, config.hidden_size)
+
+        if config.word_embed_proj_dim != config.hidden_size:
+            self.project_out = nn.Linear(config.hidden_size, config.word_embed_proj_dim, bias=False)
+        else:
+            self.project_out = None
+
+        if config.word_embed_proj_dim != config.hidden_size:
+            self.project_in = nn.Linear(config.word_embed_proj_dim, config.hidden_size, bias=False)
+        else:
+            self.project_in = None
+
+        # Note that the only purpose of `config._remove_final_layer_norm` is to keep backward compatibility
+        # with checkpoints that have been fine-tuned before transformers v4.20.1
+        # see https://github.com/facebookresearch/metaseq/pull/164
+        if config.do_layer_norm_before and not config._remove_final_layer_norm:
+            self.final_layer_norm = nn.LayerNorm(
+                config.hidden_size, elementwise_affine=config.layer_norm_elementwise_affine
+            )
+        else:
+            self.final_layer_norm = None
+        
         import os 
         set_decoder_meta = os.environ.get('SET_DECODERS_META', "0")
         if set_decoder_meta == "0":
             self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
         else:
-            from accelerate import init_empty_weights
-            del self.layers
-            with init_empty_weights():
-                self.layers = nn.ModuleList([OPTDecoderLayerSharded(config) for _ in range(config.num_hidden_layers)])
+            # init empty
+            self.layers = nn.ModuleList([None for _ in range(config.num_hidden_layers)])
+        # self.layers = nn.ModuleList([OPTDecoderLayer(config) for _ in range(config.num_hidden_layers)])
 
+        self.gradient_checkpointing = False
+        # Initialize weights and apply final processing
+        self.post_init() # init weights
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.embed_tokens = value
+
+    # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
+    @torch.no_grad()
+    def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
+        # create causal mask
+        # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                inputs_embeds.dtype,
+                device=inputs_embeds.device,
+                past_key_values_length=past_key_values_length,
+            )
+
+        if attention_mask is not None:
+            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+            expanded_attn_mask = _expand_mask(attention_mask, inputs_embeds.dtype, tgt_len=input_shape[-1]).to(
+                inputs_embeds.device
+            )
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+
+        return combined_attention_mask
             
-    
+    @torch.no_grad()
     def forward_pre(self, 
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -731,6 +852,7 @@ class OPTDecoderSeq(OPTDecoder):
             "next_decoder_cache": next_decoder_cache,
         }
 
+    @torch.no_grad()
     def forward_post(self, hidden_states, next_decoder_cache=None, use_cache=False, return_dict=False):
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
@@ -757,7 +879,8 @@ class OPTDecoderSeq(OPTDecoder):
                 return param.is_meta
 
     # inplace sharding
-    def _shard_decoders(self, sharding_strategy):
+    @torch.no_grad()
+    def _shard_decoders(self, sharding_strategy, device=None):
         layer_idxs = list(sharding_strategy.keys())
         for i in range(self.get_decoder_layer_num()):
             if i not in layer_idxs:
@@ -767,10 +890,22 @@ class OPTDecoderSeq(OPTDecoder):
         # for each layer, start sharding
         for layer_idx in layer_idxs:
             layer = self.layers[layer_idx]
-            if self.check_is_meta(layer):
+            if layer is None:
                 self.layers[layer_idx] = OPTDecoderLayerSharded(self.config).to(torch.float16)
+                print("create layer:", layer_idx, end="|")
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
+            self.layers[layer_idx].eval() # use eval mode
+            # directly move to device
+            if device is not None:
+                self.layers[layer_idx] = self.layers[layer_idx].to(device)
     
+    def load_layer_weight(self, shard_weight_dir):
+        pass
+        # for layer in self.layers:
+        #     if layer is not None:
+        #         layer.load_weight()
+
+    @torch.no_grad()
     def verify_decoder_layers(self):
         for layer in self.layers:
             if layer is not None:
@@ -783,26 +918,66 @@ class OPTDecoderSeq(OPTDecoder):
         del self.project_in
         del self.project_out
     
+    @torch.no_grad()
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
+        if not hasattr(self, 'kv_cache'):
+            self.kv_cache = {}
+        max_seq_len = prompt_length + token_to_generate
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if decoder_layer is None:
+                continue
+            if not decoder_layer.has_self_attention():
+                continue
+            bits = decoder_layer.bits[0]
+            if bits == '8:tc':
+                kv_bit = 8
+                torch_dtype = torch.int8
+            else:
+                kv_bit = 16
+                torch_dtype = torch.float16
+            hidden_size, head_num = self.config.hidden_size, self.config.num_attention_heads
+            # size should be b x i x h
+            if layer_idx not in self.kv_cache:
+                self.kv_cache[layer_idx] = {}
+            self.kv_cache[layer_idx][request_id] = [
+                # size should be 
+                torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
+                torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
+                0, # use to count the token generation
+                prompt_length
+            ]
+    
+    @torch.no_grad()
     def update_kv_cache(self, layer_idx, key_value_pair, request_id):
         if not hasattr(self, 'kv_cache'):
-            self.kv_cache = {}
-        if layer_idx not in self.kv_cache:
-            self.kv_cache[layer_idx] = {}
-        self.kv_cache[layer_idx][request_id] = key_value_pair
+            assert False, "kv_cache not initialized"
+        # copy the key value pair to the cache
+        # self.kv_cache[layer_idx][request_id] = key_value_pair
+        self.kv_cache[layer_idx][request_id][2] += 1
+        self.kv_cache[layer_idx][request_id][0][:, :, :self.kv_cache[layer_idx][request_id][2] + self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[0])
+        self.kv_cache[layer_idx][request_id][1][:, :, :self.kv_cache[layer_idx][request_id][2] + \
+                                                    self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[1])
 
-
+    @torch.no_grad()
     def get_kv_cache(self, layer_idx, request_id):
         if not hasattr(self, 'kv_cache'):
-            self.kv_cache = {}
-        if layer_idx not in self.kv_cache:
+            assert False, "kv_cache not initialized"
+        # based on the prompt_length + previous token length to fetch kv
+        prompt_length = self.kv_cache[layer_idx][request_id][3]
+        generated_token_length = self.kv_cache[layer_idx][request_id][2]
+        kv_output_length = prompt_length + generated_token_length - 1
+        if generated_token_length == 0:
             return None
-        if request_id not in self.kv_cache[layer_idx]:
-            return None
-        return self.kv_cache[layer_idx][request_id]
+        kv = (
+            self.kv_cache[layer_idx][request_id][0][:, :, :kv_output_length, :],
+            self.kv_cache[layer_idx][request_id][1][:, :, :kv_output_length, :]
+        )
+        return kv
     
     def verbose_kv_cache(self):
         print(self.kv_cache)
     
+    @torch.no_grad()
     def clear_request_kv_cache(self, request_id=1):
         for layer_idx in self.kv_cache:
             if request_id in self.kv_cache[layer_idx]:
@@ -812,6 +987,7 @@ class OPTDecoderSeq(OPTDecoder):
         self.kv_cache = {}
 
     # only remains inference related part
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.LongTensor = None,
@@ -822,14 +998,18 @@ class OPTDecoderSeq(OPTDecoder):
         next_decoder_cache: Optional[List[torch.FloatTensor]] = None,
         request_id: Optional[int] = 1,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
-        
         mask_and_cache = (attention_mask, head_mask, use_cache) 
         
         for idx, decoder_layer in enumerate(self.layers):
             if decoder_layer is None:
                 continue
+            print("inf on layer idx: ", idx)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            past_key_value = self.get_kv_cache(idx, request_id)
+            past_key_value = None
+            if decoder_layer.has_self_attention():
+                if hasattr(self, 'kv_cache'):
+                    past_key_value = self.get_kv_cache(idx, request_id)
+
             # past_key_value = past_key_values[idx] if past_key_values is not None else None
             layer_outputs = decoder_layer(
                 hidden_states,
@@ -842,10 +1022,11 @@ class OPTDecoderSeq(OPTDecoder):
             if decoder_layer.has_self_attention(): # store the kv together with the selfattn
                 if use_cache:
                     # the output will contain a present key value
-                    if type(layer_outputs[1]) == tuple:
-                        self.update_kv_cache(idx, layer_outputs[1], request_id)
-                    else:
-                        self.update_kv_cache(idx, layer_outputs[1:], request_id) # update for further usage
+                    if hasattr(self, 'kv_cache'):
+                        if type(layer_outputs[1]) == tuple:
+                            self.update_kv_cache(idx, layer_outputs[1], request_id)
+                        else:
+                            self.update_kv_cache(idx, layer_outputs[1:], request_id) # update for further usage
 
             if decoder_layer.is_only_self_attention():
                 hidden_states = (layer_outputs[0], ) # 
@@ -860,11 +1041,13 @@ class OPTDecoderSeq(OPTDecoder):
 # only to decoder
 class OPTModelSeq(OPTModel):
     def __init__(self, config: OPTConfig):
-        super().__init__(config)
+        with init_empty_weights():
+            super().__init__(config)
         self.decoder = OPTDecoderSeq(config)
         # Initialize weights and apply final processing
         self.post_init()
 
+    @torch.no_grad()
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -909,34 +1092,38 @@ class OPTModelSeq(OPTModel):
 
 class OPTForCausalLMSeq(OPTForCausalLM):
     def __init__(self, config):
-        super().__init__(config)
+        with init_empty_weights():
+            super().__init__(config)
         self.model = OPTModelSeq(config)
         # the lm_head weight is automatically tied to the embed tokens weight
         self.lm_head = nn.Linear(config.word_embed_proj_dim, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
 
+    @torch.no_grad()
     def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1):
-        input_ids_seq_length = new_input_ids.shape[1] - 1
-        embed_tokens = self.model.decoder.embed_tokens
-        pos_embeds = self.model.decoder.embed_positions
-        # embed the new input tokens
+        with torch.no_grad():
+            input_ids_seq_length = new_input_ids.shape[1] - 1
+            embed_tokens = self.model.decoder.embed_tokens
+            pos_embeds = self.model.decoder.embed_positions
+            # embed the new input tokens
 
-        inputs_embeds = embed_tokens(new_input_ids)
-        next_token_embeds = embed_tokens(next_tokens)
-        bs = next_token_embeds.size(0)
-        input_shape = (bs, 1)
-        next_token_embeds = next_token_embeds.view(bs, 1, -1)
-        attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-        p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
-        attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
-        # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
-        if self.model.decoder.project_in is not None:
-            next_token_embeds = self.model.decoder.project_in(next_token_embeds)
-        next_token_embeds = next_token_embeds + p_embeds
-        request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
-        return request_token
-
+            inputs_embeds = embed_tokens(new_input_ids)
+            next_token_embeds = embed_tokens(next_tokens)
+            bs = next_token_embeds.size(0)
+            input_shape = (bs, 1)
+            next_token_embeds = next_token_embeds.view(bs, 1, -1)
+            attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
+            p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
+            attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
+            # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
+            if self.model.decoder.project_in is not None:
+                next_token_embeds = self.model.decoder.project_in(next_token_embeds)
+            next_token_embeds = next_token_embeds + p_embeds
+            request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
+            return request_token
+    
+    @torch.no_grad()
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
                    use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1, \
                     past_key_values_length: int = 0, **kwargs):
@@ -971,6 +1158,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         return pre_result
     
     # model sharders
+    @torch.no_grad()
     def _verify_shard_strategy(self, shard_strategies):
         all_decode_ids = set()
         for idx, shard_strategy in shard_strategies.items():
@@ -978,11 +1166,14 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             all_decode_ids = all_decode_ids.union(decode_ids)
         assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
     
-    def _shard_model_current(self, shard_strategy):
-        self.model.decoder._shard_decoders(shard_strategy)
+    @torch.no_grad()
+    def _shard_model_current(self, shard_strategy, device=None):
+        self.model.decoder._shard_decoders(shard_strategy, device)
         self.model.decoder._delete_all_other_modules()
+        del self.lm_head
 
     # inplace sharding
+    @torch.no_grad()
     def _shard_model(self, shard_strategies, shard_idx):
         self.is_master = True if shard_idx == 0 else False
         if self.is_master:
@@ -990,29 +1181,32 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         current_shard_strategy = shard_strategies[shard_idx]
         self._shard_model_current(current_shard_strategy)
     
+    @torch.no_grad()
     def _pure_pre_and_post(self):
         sharded_model = copy.deepcopy(self)
         sharded_model.model.decoder._shard_decoders({}) # didn't delete the embeddings, etc.
         return sharded_model
 
     # return model instance with copy
+    @torch.no_grad()
     def shard_model(self, shard_strategies, shard_idx):
         # copy a model
         sharded_model = copy.deepcopy(self)
         sharded_model._shard_model(shard_strategies, shard_idx)
         return sharded_model
     
+    @torch.no_grad()
     def decoder_layers_to_device(self, device):
         self.model.decoder.layers = self.model.decoder.layers.to(device)
 
     # rewrite the forward function
+    @torch.no_grad()
     def decode(self, pre_result):
-
         def shard_launcher(prev_result, module_shard):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
             attention_mask, head_mask, use_cache, request_id = prev_result[1:]
-            return module_shard(
+            res = module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,
                 attention_mask=attention_mask,
@@ -1021,10 +1215,15 @@ class OPTForCausalLMSeq(OPTForCausalLM):
                 use_cache=use_cache,
                 request_id=request_id,
             )
+            return res
 
         return shard_launcher(pre_result, self.model.decoder)
 
-
+    @torch.no_grad()
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
+        return self.model.decoder.init_kv_cache(b, prompt_length, token_to_generate, request_id)
+    
+    @torch.no_grad()
     def postprocess(self, results, labels=None):
         # head_mask, attention_mask should be passed with the pre_result
         # past_key_value should be stored within the model
@@ -1054,6 +1253,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             attentions=outputs.attentions,
         )
 
+    @torch.no_grad()
     def forward(
             self,
             input_ids: torch.LongTensor = None,
