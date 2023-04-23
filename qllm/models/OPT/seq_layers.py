@@ -1003,7 +1003,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         for idx, decoder_layer in enumerate(self.layers):
             if decoder_layer is None:
                 continue
-            print("inf on layer idx: ", idx)
+            # print("inf on layer idx: ", idx)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             past_key_value = None
             if decoder_layer.has_self_attention():
