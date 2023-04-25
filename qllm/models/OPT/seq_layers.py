@@ -132,6 +132,11 @@ class Int8OPTAttention(nn.Module):
         # get query proj
         if hidden_states.dtype != torch.int8:
             hidden_states = self.fwd_tokenizer(hidden_states)
+        # print(hidden_states, hidden_states.shape, hidden_states.dtype)
+        # print(self.q_proj)
+        # print(self.q_proj.weight, self.q_proj.weight.shape, self.q_proj.weight.dtype)
+        # print(self.q_proj.bias, self.q_proj.bias.shape, self.q_proj.bias.dtype)
+        # print(self.q_proj.a, self.q_proj.b)
         query_states = self.q_proj(hidden_states)
         # get key, value proj
         if is_cross_attention and past_key_value is not None:
@@ -177,12 +182,13 @@ class Int8OPTAttention(nn.Module):
         # import pdb; pdb.set_trace()
         # the bmm can only done in fp16. requires strict alginment and padding
         # attn_weights = self.qk_bmm(query_states, key_states)
-        attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
-        value_states = value_states.half()
+        query_states = query_states.half()
+        key_states = key_states.half()
+        attn_weights = torch.bmm(query_states, key_states.transpose(1,2)).contiguous()
         # if src_len % 16:
         #     attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
         # else:
-        #     attn_weights = self.qk_bmm(query_states, key_states)
+        # attn_weights = self.qk_bmm(query_states, key_states)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
             raise ValueError(
@@ -232,8 +238,10 @@ class Int8OPTAttention(nn.Module):
             attn_probs_reshaped = None
 
         # (A_row V_row)_row = (A_row V_col ^T)_row
+        value_states = value_states.half().contiguous()
+        attn_probs.mul_(127).round_()
         attn_output = torch.bmm(attn_probs, value_states) # here the value is in fp16
-        # round the value into the int8 range
+        # # round the value into the int8 range
         attn_output.clamp_(-127, 127).round_()
         attn_output = attn_output.to(torch.int8)
 
@@ -241,10 +249,10 @@ class Int8OPTAttention(nn.Module):
         #     attn_output = torch.bmm(attn_probs.half(), value_states.half())
         #     attn_output = attn_output.to(torch.int8)
         # else:
-        #     attn_probs.mul_(127).round_()
-        #     attn_probs = attn_probs.to(torch.int8)
-        #     value_states = value_states.transpose(1, 2).contiguous()
-        #     attn_output = self.pv_bmm(attn_probs, value_states)
+        # attn_probs.mul_(127).round_()
+        # attn_probs = attn_probs.to(torch.int8)
+        # value_states = value_states.transpose(1, 2).contiguous()
+        # attn_output = self.pv_bmm(attn_probs, value_states)
 
         if attn_output.size() != (bsz * self.num_heads, tgt_len, self.head_dim):
             raise ValueError(
@@ -918,10 +926,12 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         del self.project_in
         del self.project_out
     
+    # kv related operations
     @torch.no_grad()
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
         if not hasattr(self, 'kv_cache'):
             self.kv_cache = {}
+            self.kv_status = {}
         max_seq_len = prompt_length + token_to_generate
         for layer_idx, decoder_layer in enumerate(self.layers):
             if decoder_layer is None:
@@ -939,13 +949,17 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             # size should be b x i x h
             if layer_idx not in self.kv_cache:
                 self.kv_cache[layer_idx] = {}
-            self.kv_cache[layer_idx][request_id] = [
+                self.kv_status[layer_idx] = {}
+            kv_shape = (b, head_num, max_seq_len, hidden_size // head_num)
+            # 2kv shape
+            kv_shape_2 = (b, head_num, max_seq_len, hidden_size // head_num, 2)
+            self.kv_cache[layer_idx][request_id] = torch.empty(kv_shape_2, dtype=torch_dtype, device=self.device)
+                # 2b
                 # size should be 
-                torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
-                torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
-                0, # use to count the token generation
-                prompt_length
-            ]
+                # torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
+                # torch.empty((b, head_num, max_seq_len, hidden_size // head_num), dtype=torch_dtype, device=self.device),
+            
+            self.kv_status[layer_idx][request_id] = [0, prompt_length]
     
     @torch.no_grad()
     def update_kv_cache(self, layer_idx, key_value_pair, request_id):
@@ -953,24 +967,31 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             assert False, "kv_cache not initialized"
         # copy the key value pair to the cache
         # self.kv_cache[layer_idx][request_id] = key_value_pair
-        self.kv_cache[layer_idx][request_id][2] += 1
-        self.kv_cache[layer_idx][request_id][0][:, :, :self.kv_cache[layer_idx][request_id][2] + self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[0])
-        self.kv_cache[layer_idx][request_id][1][:, :, :self.kv_cache[layer_idx][request_id][2] + \
-                                                    self.kv_cache[layer_idx][request_id][3] - 1, :].copy_(key_value_pair[1])
+        prev_token_length = self.kv_status[layer_idx][request_id][0]
+        prompt_length = self.kv_status[layer_idx][request_id][1]
+
+        self.kv_cache[layer_idx][request_id][:, :, :prev_token_length + prompt_length, :, 0].copy_(key_value_pair[0])
+        self.kv_cache[layer_idx][request_id][:, :, :prev_token_length + prompt_length, :, 1].copy_(key_value_pair[1])
+        # update token length
+        self.kv_status[layer_idx][request_id][0] += 1
 
     @torch.no_grad()
     def get_kv_cache(self, layer_idx, request_id):
         if not hasattr(self, 'kv_cache'):
             assert False, "kv_cache not initialized"
         # based on the prompt_length + previous token length to fetch kv
-        prompt_length = self.kv_cache[layer_idx][request_id][3]
-        generated_token_length = self.kv_cache[layer_idx][request_id][2]
-        kv_output_length = prompt_length + generated_token_length - 1
-        if generated_token_length == 0:
+        prev_token_length = self.kv_status[layer_idx][request_id][0]
+        prompt_length = self.kv_status[layer_idx][request_id][1]
+        kv_output_length = prompt_length + prev_token_length - 1
+
+        if prev_token_length == 0:
             return None
+        # kv = torch.split(self.kv_cache[layer_idx][request_id], [1,1], dim=-1)
+        # shape = kv[0].shape
+        # kv = (kv[0].view(shape[:-1]), kv[1].view(shape[:-1]))
         kv = (
-            self.kv_cache[layer_idx][request_id][0][:, :, :kv_output_length, :],
-            self.kv_cache[layer_idx][request_id][1][:, :, :kv_output_length, :]
+            self.kv_cache[layer_idx][request_id][:, :, :kv_output_length, :, 0],
+            self.kv_cache[layer_idx][request_id][:, :, :kv_output_length, :, 1]
         )
         return kv
     

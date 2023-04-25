@@ -16,19 +16,22 @@ from transformers import LogitsProcessorList, StoppingCriteriaList
 if __name__ == '__main__':
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
+    max_length = 512
+    # sample text
     batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog. ", "Just test performance. How about you. ", \
-                                                "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], padding=True, return_tensors="pt")
+                                                "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], \
+                                                padding='max_length', max_length=max_length, return_tensors="pt")
     
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m", torch_dtype=torch.float16)
     sharding_strategy = {
         0: {
             0: {'shard': [0, 1], 'bits': [16, 16]},
             1: {'shard': [0, 1], 'bits': [16, 16]},
-            2: {'shard': [0, 1], 'bits': [16, 16]},
-            3: {'shard': [0, 1], 'bits': [16, 16]},
-            4: {'shard': [0, 1], 'bits': [16, 16]},
+            2: {'shard': [0, 1], 'bits': ['8:tc', '8:tc']},
+            3: {'shard': [0, 1], 'bits': ['8:tc-li', 16]},
+            4: {'shard': [0, 1], 'bits': [16, 4]},
             5: {'shard': [0, 1], 'bits': [16, 16]},
-            6: {'shard': [0], 'bits': [16]},
+            6: {'shard': [0], 'bits': ['8:tc']},
         },
         1: {
             6: {'shard': [1], 'bits': [16]},
@@ -86,6 +89,7 @@ if __name__ == '__main__':
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
     model_2 = weight_loaded_model.shard_model(sharding_strategy, 1)
     model_3 = weight_loaded_model.shard_model(sharding_strategy, 2)
+    model_packs = [model, model_2, model_3]
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -94,14 +98,12 @@ if __name__ == '__main__':
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
     opt_125M = opt_125M.cuda()
+
+    # init KV cache
+    num_tokens_to_generate = 100
+    bs, prompt_length = batched_ids['input_ids'].shape
     # becareful to use this one
     batched_ids = to_device_recursive(dict(batched_ids), device)
-
-    # eval mode
-    # model.eval()
-    # model_2.eval()
-    # model_3.eval()
-    # opt_125M.eval()
 
     # print model 1, 2, 3 size in MB
     print("Original Model Size:", get_model_size_cuda(opt_125M.model, 'MB'))
@@ -113,7 +115,6 @@ if __name__ == '__main__':
     with torch.no_grad():
         res_2 = opt_125M(**batched_ids)
 
-    
     def generate_one_token(request_token, input_ids):
         with torch.no_grad():
             intermediate_results = model.decode(request_token)
@@ -150,7 +151,12 @@ if __name__ == '__main__':
     request_token = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=1)
     request_token2 = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=2)
 
-    num_tokens_to_generate = 8
+    # print(request_token)
+    # init kv cache for all requests
+    for k_model in model_packs:
+        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
+        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=2)
+
     original_token = copy.deepcopy(input_ids)
     input_ids2 = copy.deepcopy(input_ids)
     for i in range(num_tokens_to_generate):
@@ -162,6 +168,8 @@ if __name__ == '__main__':
 
         input_ids = new_input_ids
         input_ids2 = new_input_ids2
+        # print("token generated: ", i)
+
 
     print(original_token.shape, new_input_ids.shape, new_input_ids2.shape)
     # print model 1, 2, 3 size in MB
