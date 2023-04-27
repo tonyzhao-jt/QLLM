@@ -353,13 +353,11 @@ class BloomBlockSharded(nn.Module):
                     bit = "8:tc-li"
                 if bit == '8:tc-li':
                     bit = 8
-                    self.mlp.dense_h_to_4h = quantize_one_linear_module(self.mlp.dense_h_to_4h, kernel_bit=bit, caliber=caliber)
-                    self.mlp.dense_4h_to_h = quantize_one_linear_module(self.mlp.dense_h_to_4h, kernel_bit=bit, caliber=caliber)
+                    quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber)
                 else:
                     # logger.info("use non-kernel quantization for f1f2")
                     # adaptive quantization for BITSANDBYTES and GPTQ
-                    self.mlp.dense_h_to_4h = quantize_one_linear_module(self.mlp.dense_h_to_4h, kernel_bit=bit, caliber=None)
-                    self.mlp.dense_4h_to_h = quantize_one_linear_module(self.mlp.dense_4h_to_h, kernel_bit=bit, caliber=None)
+                    quantize_linear_module_with_bit(self.mlp, bit, caliber=None)
                 
     @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, past_key_value, layer_head_mask, alibi=None, output_attentions=False, use_cache=False):
@@ -584,7 +582,7 @@ class BloomModelSeq(BloomModel):
         for layer_idx in layer_idxs:
             layer = self.h[layer_idx]
             if layer is None:
-                self.h[layer_idx] = BloomBlock(self.config).to(torch.float16)
+                self.h[layer_idx] = BloomBlockSharded(self.config).to(torch.float16)
                 print("create layer:", layer_idx, end="|")
             self.h[layer_idx].shard(sharding_strategy[layer_idx])
             self.h[layer_idx].eval() # use eval mode

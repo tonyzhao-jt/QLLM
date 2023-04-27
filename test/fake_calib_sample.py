@@ -1,11 +1,4 @@
 
-from qllm.models import opt 
-from qllm.utils import get_model_size_cuda, list_tensors_on_cuda
-from qllm.utils import (
-    check_model_weights_dtype,
-    to_device_recursive, to_device_recursive_except, 
-    to_dtype_recursive, to_dtype_recursive_except, to_dtype_except_linear_layer, to_half_for_modules
-)
 from qllm.models.OPT import OPTDecoderLayerSharded
 from qllm.models import opt
 
@@ -49,7 +42,7 @@ if __name__ == '__main__':
 
     h1 = config.hidden_size
     fake_input = torch.randn(batch_size, input_seq_length, h1)
-    decoder_layer = BloomBlockSharded(config)
+    decoder_layer = decoder_constructor(config)
 
     caliber = lptorch.inner_caliber
     caliber.set_fake()  
@@ -70,9 +63,3 @@ if __name__ == '__main__':
 
     caliber.save_fake_calib_data(f'fake_calib_{model_name}_{model_size}.pkl')
     caliber.load_fake_calib_data(f'fake_calib_{model_name}_{model_size}.pkl')
-
-    
-
-    
-
-
