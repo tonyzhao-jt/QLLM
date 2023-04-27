@@ -1,5 +1,4 @@
 
-from qllm.models import opt 
 from qllm.utils import get_model_size_cuda, list_tensors_on_cuda
 from qllm.utils import (
     check_model_weights_dtype,
@@ -7,14 +6,16 @@ from qllm.utils import (
     to_dtype_recursive, to_dtype_recursive_except, to_dtype_except_linear_layer, to_half_for_modules,
     get_iter_variable_size
 )
-from qllm.models.OPT import OPTForCausalLMSeq
+from qllm.models.BLOOM import BloomForCausalLMSeq
+from qllm.models import bloom
 import lptorch
 import torch
 import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
 if __name__ == '__main__':
-    opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
+    model_config = 'bigscience/bloom-560m'
+    bloom_560m, tokenizer = bloom.load_pretained_model_from_net(model_config)
     # sample text
     max_length = 512
     # sample text
@@ -22,69 +23,49 @@ if __name__ == '__main__':
                                                 "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], \
                                                 padding='max_length', max_length=max_length, return_tensors="pt")
     
-    weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m", torch_dtype=torch.float16)
+    weight_loaded_model = BloomForCausalLMSeq.from_pretrained(model_config, torch_dtype=torch.float16)
+    print("decoder layernum", weight_loaded_model.get_decoder_layer_num())
+    
     sharding_strategy = {
         0: {
-            0: {'shard': [0, 1], 'bits': [16, 16]},
-            1: {'shard': [0, 1], 'bits': [16, 16]},
-            2: {'shard': [0, 1], 'bits': ['8:tc', '8:tc']},
-            3: {'shard': [0, 1], 'bits': ['8:tc-li', 16]},
-            4: {'shard': [0, 1], 'bits': [16, 4]},
-            5: {'shard': [0, 1], 'bits': [16, 16]},
-            6: {'shard': [0], 'bits': ['8:tc']},
         },
         1: {
-            6: {'shard': [1], 'bits': [16]},
-            7: {'shard': [0,1], 'bits': [16, 16]},
-            8: {'shard': [0,1], 'bits': [16, 16]},
+            0: {'shard': [0, 1], 'bits': [16, 16]},
+            1: {'shard': [0, 1], 'bits': [16, 16]},
+            2: {'shard': [0, 1], 'bits': [16, 16]},
+            3: {'shard': [0, 1], 'bits': [16, 16]},
+            4: {'shard': [0, 1], 'bits': [16, 16]},
+            5: {'shard': [0, 1], 'bits': [16, 16]},
+            6: {'shard': [0, 1], 'bits': [16, 16]},
+            7: {'shard': [0, 1], 'bits': [16, 16]},
+            8: {'shard': [0], 'bits': [16]},
         },
         2: {
+            8: {'shard': [1], 'bits': [16]},
             9: {'shard': [0,1], 'bits': [16, 16]},
             10: {'shard': [0,1], 'bits': [16, 16]},
             11: {'shard': [0,1], 'bits': [16, 16]},
+            # 350M
+            12: {'shard': [0,1], 'bits': [16, 16]},
+            13: {'shard': [0,1], 'bits': [16, 16]},
+            14: {'shard': [0,1], 'bits': [16, 16]},
+            15: {'shard': [0,1], 'bits': [16, 16]},
+            16: {'shard': [0,1], 'bits': [16, 16]},
+            17: {'shard': [0,1], 'bits': [16, 16]},
+            18: {'shard': [0,1], 'bits': [16, 16]},
+            19: {'shard': [0,1], 'bits': [16, 16]},
+            20: {'shard': [0,1], 'bits': [16, 16]},
+            21: {'shard': [0,1], 'bits': [16, 16]},
+            22: {'shard': [0,1], 'bits': [16, 16]}, 
+            23: {'shard': [0,1], 'bits': [16, 16]},
         }
-    }
-    print("decoder layernum", weight_loaded_model.get_decoder_layer_num())
-    
-    # sharding_strategy = {
-    #     0: {
-    #     },
-    #     1: {
-    #         0: {'shard': [0, 1], 'bits': [16, 16]},
-    #         1: {'shard': [0, 1], 'bits': [16, 16]},
-    #         2: {'shard': [0, 1], 'bits': [16, 16]},
-    #         3: {'shard': [0, 1], 'bits': [16, 16]},
-    #         4: {'shard': [0, 1], 'bits': [16, 16]},
-    #         5: {'shard': [0, 1], 'bits': [16, 16]},
-    #         6: {'shard': [0, 1], 'bits': [16, 16]},
-    #         7: {'shard': [0, 1], 'bits': [16, 16]},
-    #         8: {'shard': [0], 'bits': [16]},
-    #     },
-    #     2: {
-    #         8: {'shard': [1], 'bits': [16]},
-    #         9: {'shard': [0,1], 'bits': [16, 16]},
-    #         10: {'shard': [0,1], 'bits': [16, 16]},
-    #         11: {'shard': [0,1], 'bits': [16, 16]},
-    #         # 350M
-    #         12: {'shard': [0,1], 'bits': [16, 16]},
-    #         13: {'shard': [0,1], 'bits': [16, 16]},
-    #         14: {'shard': [0,1], 'bits': [16, 16]},
-    #         15: {'shard': [0,1], 'bits': [16, 16]},
-    #         16: {'shard': [0,1], 'bits': [16, 16]},
-    #         17: {'shard': [0,1], 'bits': [16, 16]},
-    #         18: {'shard': [0,1], 'bits': [16, 16]},
-    #         19: {'shard': [0,1], 'bits': [16, 16]},
-    #         20: {'shard': [0,1], 'bits': [16, 16]},
-    #         21: {'shard': [0,1], 'bits': [16, 16]},
-    #         22: {'shard': [0,1], 'bits': [16, 16]}, 
-    #         23: {'shard': [0,1], 'bits': [16, 16]},
-    #     }
-    # }    
+    }    
     
     # set calib results
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
-    caliber.load_calib_data('./opt_350M_calib_data.pkl')
+    caliber.set_fake()
+    caliber.load_fake_calib_data('./fake_calib_bloom_560m.pkl')
 
     model_pre_and_post = weight_loaded_model._pure_pre_and_post()
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
@@ -98,7 +79,7 @@ if __name__ == '__main__':
     model.decoder_layers_to_device(device)
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
-    opt_125M = opt_125M.cuda()
+    bloom_560m = bloom_560m.cuda()
 
     # init KV cache
     num_tokens_to_generate = 100
@@ -107,14 +88,14 @@ if __name__ == '__main__':
     batched_ids = to_device_recursive(dict(batched_ids), device)
 
     # print model 1, 2, 3 size in MB
-    print("Original Model Size:", get_model_size_cuda(opt_125M.model, 'MB'))
+    print("Original Model Size:", get_model_size_cuda(bloom_560m, 'MB'))
     # print model 1, 2, 3 size in MB
-    print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
-    print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
-    print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
+    print("Model 1 size: ", get_model_size_cuda(model, 'MB'))
+    print("Model 2 size: ", get_model_size_cuda(model_2, 'MB'))
+    print("Model 3 size: ", get_model_size_cuda(model_3, 'MB'))
 
     with torch.no_grad():
-        res_2 = opt_125M(**batched_ids)
+        res_2 = bloom_560m(**batched_ids)
 
     def generate_one_token(request_token, input_ids):
         with torch.no_grad():
@@ -135,7 +116,7 @@ if __name__ == '__main__':
     input_ids = batched_ids['input_ids']
     # prepare the logits processor
     logits_processor = LogitsProcessorList()
-    generation_config = opt_125M.generation_config
+    generation_config = bloom_560m.generation_config
     inputs_tensor, model_input_name, model_kwargs = model._prepare_model_inputs(
         input_ids, generation_config.bos_token_id, {}
     )
@@ -160,6 +141,7 @@ if __name__ == '__main__':
 
     original_token = copy.deepcopy(input_ids)
     input_ids2 = copy.deepcopy(input_ids)
+
     for i in range(num_tokens_to_generate):
         new_input_ids, next_token = generate_one_token(request_token, input_ids)
         new_input_ids2, next_token2 = generate_one_token(request_token2, input_ids2)
@@ -174,9 +156,9 @@ if __name__ == '__main__':
 
     print(original_token.shape, new_input_ids.shape, new_input_ids2.shape)
     # print model 1, 2, 3 size in MB
-    print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
-    print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
-    print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
+    print("Model 1 size: ", get_model_size_cuda(model, 'MB'))
+    print("Model 2 size: ", get_model_size_cuda(model_2, 'MB'))
+    print("Model 3 size: ", get_model_size_cuda(model_3, 'MB'))
 
     result_one_time = tokenizer.batch_decode(new_input_ids, skip_special_tokens=True)
     result_one_time2 = tokenizer.batch_decode(new_input_ids2, skip_special_tokens=True)

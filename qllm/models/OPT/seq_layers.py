@@ -4,17 +4,13 @@ import torch
 from transformers import (
     OPTConfig,
     OPTForCausalLM,
-    AutoTokenizer,
-    
 )
 # original ones
 from transformers.models.opt.modeling_opt import (
     OPTAttention,
-    OPTDecoderLayer,
     OPTForCausalLM,
     OPTLearnedPositionalEmbedding,
     OPTModel,
-    OPTDecoder,
     OPTPreTrainedModel,
     _make_causal_mask, _expand_mask
 )
@@ -36,6 +32,8 @@ import copy
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
 from lptorch.utils import is_tensorcore_int8_available, get_capability
+
+from torch.nn.functional import pad
 
 cap = get_capability()
 if cap >= 80:
@@ -804,6 +802,18 @@ class OPTDecoderSeq(OPTPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # input_len = input_ids.shape[1]
+        # from torch.nn.functional import pad
+        # if input_len % 16 != 0:
+        #     # <pad> is 1
+        #     padding_len = 16 - input_len % 16
+        #     input_ids = pad(input_ids, (0, padding_len), value=1)
+        #     if attention_mask is not None:
+        #         attention_mask = pad(attention_mask, (0, padding_len), value=0)
+        #     self.input_len = input_len 
+        # else:
+        #     self.input_len = None
+
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
@@ -862,6 +872,9 @@ class OPTDecoderSeq(OPTPreTrainedModel):
 
     @torch.no_grad()
     def forward_post(self, hidden_states, next_decoder_cache=None, use_cache=False, return_dict=False):
+        # if self.input_len is not None:
+        #     hidden_states = hidden_states[:, :self.input_len, :]
+
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
 
@@ -970,8 +983,8 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         prev_token_length = self.kv_status[layer_idx][request_id][0]
         prompt_length = self.kv_status[layer_idx][request_id][1]
 
-        self.kv_cache[layer_idx][request_id][:, :, :prev_token_length + prompt_length, :, 0].copy_(key_value_pair[0])
-        self.kv_cache[layer_idx][request_id][:, :, :prev_token_length + prompt_length, :, 1].copy_(key_value_pair[1])
+        self.kv_cache[layer_idx][request_id][:, :, prev_token_length:prev_token_length + prompt_length, :, 0].copy_(key_value_pair[0][:, :, prev_token_length:prev_token_length + prompt_length, :])
+        self.kv_cache[layer_idx][request_id][:, :, prev_token_length:prev_token_length + prompt_length, :, 1].copy_(key_value_pair[1][:, :, prev_token_length:prev_token_length + prompt_length, :])
         # update token length
         self.kv_status[layer_idx][request_id][0] += 1
 
@@ -1178,14 +1191,18 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
         return pre_result
     
+    def get_decoder_layer_num(self):
+        return self.model.decoder.get_decoder_layer_num()
+    
     # model sharders
     @torch.no_grad()
     def _verify_shard_strategy(self, shard_strategies):
         all_decode_ids = set()
+        decoder_layer_num = self.get_decoder_layer_num()
         for idx, shard_strategy in shard_strategies.items():
             decode_ids = shard_strategy.keys()
             all_decode_ids = all_decode_ids.union(decode_ids)
-        assert len(list(all_decode_ids)) == len(self.model.decoder.layers), f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
+        assert len(list(all_decode_ids)) == decoder_layer_num, f"MUST EQUAL {len(list(all_decode_ids))}/{len(self.model.decoder.layers)}"
     
     @torch.no_grad()
     def _shard_model_current(self, shard_strategy, device=None):
