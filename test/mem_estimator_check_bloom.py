@@ -16,7 +16,7 @@ import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
 if __name__ == '__main__':
-    model_config = 'bigscience/bloom-560m'
+    model_config = 'bigscience/bloom-1b1'
     bloom_560m, tokenizer = bloom.load_pretained_model_from_net(model_config)
     # sample text
     max_length = 512
@@ -27,7 +27,6 @@ if __name__ == '__main__':
     
     weight_loaded_model = BloomForCausalLMSeq.from_pretrained(model_config, torch_dtype=torch.float16)
     print("decoder layernum", weight_loaded_model.get_decoder_layer_num())
-
     sharding_strategy = {
         0: {
         },
@@ -43,18 +42,18 @@ if __name__ == '__main__':
             8: {'shard': [0], 'bits': [16]},
         },
         2: {
-            8: {'shard': [1], 'bits': [16]},
-            9: {'shard': [0,1], 'bits': [16, 16]},
-            10: {'shard': [0,1], 'bits': [16, 16]},
+            8: {'shard': [1], 'bits': [2]},
+            9: {'shard': [0,1], 'bits': [16, 8]},
+            10: {'shard': [0,1], 'bits': [4, 8]},
             11: {'shard': [0,1], 'bits': [16, 16]},
             # 350M
-            12: {'shard': [0,1], 'bits': [16, 16]},
-            13: {'shard': [0,1], 'bits': [16, 16]},
+            12: {'shard': [0,1], 'bits': ['8:tc', 16]},
+            13: {'shard': [0,1], 'bits': [8, 16]},
             14: {'shard': [0,1], 'bits': [16, 16]},
             15: {'shard': [0,1], 'bits': [16, 16]},
-            16: {'shard': [0,1], 'bits': [16, 16]},
+            16: {'shard': [0,1], 'bits': [16, 8]},
             17: {'shard': [0,1], 'bits': [16, 16]},
-            18: {'shard': [0,1], 'bits': [16, 16]},
+            18: {'shard': [0,1], 'bits': [16, 8]},
             19: {'shard': [0,1], 'bits': [16, 16]},
             20: {'shard': [0,1], 'bits': [16, 16]},
             21: {'shard': [0,1], 'bits': [16, 16]},
@@ -157,7 +156,7 @@ if __name__ == '__main__':
     config = bloom_560m.config
     vocab_size = config.vocab_size
     max_position_embeddings = 0
-    word_embed_proj_dim = 0
+    word_embed_proj_dim = h1
 
     print(h1, h2)
     print(b, s, n)
