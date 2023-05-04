@@ -1,5 +1,7 @@
 import torch.nn as nn 
 import torch
+# import dist
+import torch.distributed as dist
 from transformers import (
     BloomConfig,
     BloomForCausalLM,
@@ -22,14 +24,14 @@ from transformers.models.bloom.modeling_bloom import (
     BloomForCausalLM,
     BloomModel,
     BloomBlock,
-    BloomAttention,
-    BloomMLP
+    BloomGelu
 )
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
+import qllm.tp as tp 
 import lptorch
-from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer
+from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
 from lptorch.utils import is_tensorcore_int8_available, get_capability
 cap = get_capability()
 
@@ -52,6 +54,38 @@ def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: 
     out = F.dropout(x, p=prob, training=training)
     out = residual + out
     return out
+
+
+class BloomMLP(nn.Module):
+    def __init__(self, config: BloomConfig):
+        super().__init__()
+        hidden_size = config.hidden_size
+
+        self.pretraining_tp = config.pretraining_tp
+        self.slow_but_exact = config.slow_but_exact
+        self.dense_h_to_4h = nn.Linear(hidden_size, 4 * hidden_size)
+        self.gelu_impl = BloomGelu()
+        self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
+        self.hidden_dropout = config.hidden_dropout
+
+
+    def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
+
+        if self.pretraining_tp > 1 and self.slow_but_exact:
+            intermediate_output = torch.zeros_like(residual)
+            slices = self.dense_4h_to_h.weight.shape[-1] / self.pretraining_tp
+            for i in range(self.pretraining_tp):
+                intermediate_output = intermediate_output + F.linear(
+                    hidden_states[:, :, int(i * slices) : int((i + 1) * slices)],
+                    self.dense_4h_to_h.weight[:, int(i * slices) : int((i + 1) * slices)],
+                )
+        else:
+            intermediate_output = self.dense_4h_to_h(hidden_states)
+
+        output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
+
+        return output
 
 class BloomAttention(nn.Module):
     def __init__(self, config: BloomConfig):
@@ -79,6 +113,27 @@ class BloomAttention(nn.Module):
         self.query_key_value = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=True)
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
         self.attention_dropout = nn.Dropout(config.attention_dropout)
+
+        self.enable_tp = False
+        self.tp_comm_group = None
+    
+    def register_tp(self, bit, slice_k, index, caliber, tp_comm_group):
+        assert tp_comm_group is not None, "tp_comm_group must be specified"
+        tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=tp_comm_group)
+        tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=tp_comm_group)
+        kvq = self.query_key_value
+        # first column then row
+        self.query_key_value = quantize_one_linear_module(kvq, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
+        self.dense = quantize_one_linear_module(self.dense, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
+        # enable tp
+        self.tp_comm_group = tp_comm_group
+        self.enable_tp = True
+        self.tp_group_index = index
+        self.tp_slice_k = slice_k
+
+        # partition along the head dim
+        self.head_dim = self.head_dim // slice_k
+    
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -132,6 +187,10 @@ class BloomAttention(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ):
+        # when tensor parallel, split hidden_states at the front, gather at the end.
+        if self.enable_tp:
+            hidden_states = tp._scatter_last_dim(hidden_states, self.tp_group_index, self.tp_slice_k, self.tp_comm_group)
+
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
 
         # 3 x [batch_size, seq_length, num_heads, head_dim]
@@ -204,6 +263,10 @@ class BloomAttention(nn.Module):
         else:
             output_tensor = self.dense(context_layer)
 
+        if self.enable_tp:
+            # gather result
+            output_tensor = tp._all_reduce_sum(output_tensor, self.tp_comm_group)
+        
         output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
 
         outputs = (output_tensor, present)

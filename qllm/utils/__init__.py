@@ -4,3 +4,4 @@ from .dtype_handler import to_dtype_recursive, to_dtype_recursive_except, to_dty
 from .param_status import get_iter_variable_size
 from .mem_estimator import ModelMemEstimator
 from .device_precision import get_available_bits, get_available_bits_offline
+from .simple_partition import partition_a_into_b_bins
