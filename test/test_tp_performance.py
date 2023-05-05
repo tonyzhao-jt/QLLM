@@ -15,8 +15,9 @@ import qllm
 from qllm.models.BLOOM import BloomAttention, BloomForCausalLMSeq
 from qllm.models import bloom
 from time import perf_counter
-dist.init_process_group(backend='gloo', init_method='env://')
+from transformers import AutoTokenizer
 
+dist.init_process_group(backend='gloo', init_method='env://')
 # Define the group membership
 world_size = dist.get_world_size()
 rank = dist.get_rank()
@@ -34,11 +35,12 @@ from lptorch import CalibHelper, quantize_one_linear_module, AdaQTPConfig
 
 dist.barrier()
 comm_group_size = dist.get_world_size(group=comm_group)
-hidden_size = 768
-tensor_size = (4, 1, hidden_size)
+hidden_size = 1536
+tensor_size = (3, 128, hidden_size)
 dtype = torch.float16
 sample_x = torch.rand(tensor_size)
-linear = torch.nn.Linear(hidden_size, hidden_size)
+# linear = torch.nn.Linear(hidden_size, hidden_size) # normal kv
+linear = torch.nn.Linear(hidden_size, 3 * hidden_size) # fused qkv
 # caliber
 caliber = CalibHelper(linear)
 caliber.register_forward_hooks()
@@ -74,6 +76,10 @@ if rank in group_ranks:
         # sample_x = torch.empty_like(sample_x).cuda()
         # print(qllm._globals.HIDDEN_STATE_TENSOR_SHAPE)
         sample_x = torch.empty(qllm._globals.HIDDEN_STATE_TENSOR_SHAPE).cuda().half()
+    
+    '''
+    
+    '''
 
     '''
     for col-wise
@@ -105,19 +111,24 @@ if rank in group_ranks:
         # print(linear.weight, sample_x)
         # print(linear.bias)
         # print(res, result)
+    
 
+# block test.
 dist.barrier()
+
 if rank == 0:
     print("---- TEST BLOOM ----")
-config = 'bigscience/bloom-3b1'
-bloom_560m, tokenizer = bloom.load_pretained_model_from_net(config)
+
+model_size = '560m'
+config = bloom.model_cards[model_size]
+tokenizer = AutoTokenizer.from_pretrained("bigscience/bloom")
 # sample text
-max_length = 128
+max_length = 512
 # sample text
 batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog. ", "Just test performance. How about you. ", \
                                             "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], \
                                                 padding='max_length', max_length=max_length, return_tensors="pt")
-weight_loaded_model = BloomForCausalLMSeq.from_pretrained(config, torch_dtype=torch.float16)
+weight_loaded_model = BloomForCausalLMSeq._from_config(config, torch_dtype=torch.float16)
 weight_loaded_model = weight_loaded_model.cuda()
 batched_ids = {k: v.cuda() for k, v in batched_ids.items()}
 request_token = weight_loaded_model.preprocess(**batched_ids, use_cache=True, request_id=1)
@@ -125,10 +136,17 @@ bloom_attn = weight_loaded_model.transformer.h[0].self_attention
 hidden_size = bloom_attn.hidden_size
 hidden_states, causal_mask, head_mask, alibi, use_cache, request_id = request_token
 cnt_times = 10
+caliber.set_model(weight_loaded_model)
+caliber.set_fake()
+caliber.load_fake_calib_data('./fake_calib_bloom_1b1.pkl')
 if rank == 0:
     torch.cuda.synchronize()
-    start = perf_counter()
     bloom_attn_cuda = bloom_attn.cuda()
+    # warmup
+    for _ in range(cnt_times):
+        fake_out = bloom_attn_cuda(hidden_states, residual=hidden_states, alibi=alibi, attention_mask=causal_mask)
+        torch.cuda.synchronize()
+    start = perf_counter()
     for _ in range(cnt_times):
         fake_out = bloom_attn_cuda(hidden_states, residual=hidden_states, alibi=alibi, attention_mask=causal_mask)
         torch.cuda.synchronize()
@@ -142,9 +160,13 @@ if rank in group_ranks:
     bit = 16
     # bloom_attn.register_tp(8, slice_k, index, caliber, comm_group)
     bloom_attn.register_tp(bit, slice_k, index, caliber, comm_group)
-    dist.barrier(group=comm_group)
-    start = perf_counter()
     bloom_attn_cuda = bloom_attn.cuda()
+    dist.barrier(group=comm_group)
+    # warmup
+    for _ in range(cnt_times):
+        out = bloom_attn_cuda(hidden_states, residual=hidden_states, alibi=alibi, attention_mask=causal_mask)
+        torch.cuda.synchronize()
+    start = perf_counter()
     for _ in range(cnt_times):
         out = bloom_attn_cuda(hidden_states, residual=hidden_states, alibi=alibi, attention_mask=causal_mask)
         torch.cuda.synchronize()

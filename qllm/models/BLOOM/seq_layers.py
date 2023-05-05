@@ -68,8 +68,32 @@ class BloomMLP(nn.Module):
         self.dense_4h_to_h = nn.Linear(4 * hidden_size, hidden_size)
         self.hidden_dropout = config.hidden_dropout
 
+        self.enable_tp = False
+        self.tp_comm_group = None
+    
+
+    def register_tp(self, bit, slice_k, index, caliber, tp_comm_group, broadcast=True):
+        assert tp_comm_group is not None, "tp_comm_group must be specified"
+        tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=tp_comm_group)
+        tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=tp_comm_group)
+        # first column then row
+        self.dense_h_to_4h = quantize_one_linear_module(self.dense_h_to_4h, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
+        self.dense_4h_to_h = quantize_one_linear_module(self.dense_4h_to_h, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
+        # enable tp
+        self.tp_comm_group = tp_comm_group
+        self.enable_tp = True
+        self.tp_group_index = index
+        self.tp_slice_k = slice_k
+
+        # partition along the head dim
+        self.head_dim = self.head_dim // slice_k
+        self.broadcast = broadcast
+
 
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        if self.enable_tp and self.broadcast:
+            tp._broad_cast(hidden_states, self.tp_comm_group) # broadcast hidden states
+            
         hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
 
         if self.pretraining_tp > 1 and self.slow_but_exact:
@@ -117,7 +141,7 @@ class BloomAttention(nn.Module):
         self.enable_tp = False
         self.tp_comm_group = None
     
-    def register_tp(self, bit, slice_k, index, caliber, tp_comm_group):
+    def register_tp(self, bit, slice_k, index, caliber, tp_comm_group, broadcast=True):
         assert tp_comm_group is not None, "tp_comm_group must be specified"
         tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=tp_comm_group)
         tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=tp_comm_group)
@@ -133,6 +157,7 @@ class BloomAttention(nn.Module):
 
         # partition along the head dim
         self.head_dim = self.head_dim // slice_k
+        self.broadcast = broadcast
     
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -187,10 +212,9 @@ class BloomAttention(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
     ):
+        if self.enable_tp and self.broadcast:
+            tp._broad_cast(hidden_states, self.tp_comm_group) # broadcast hidden states
         # when tensor parallel, split hidden_states at the front, gather at the end.
-        if self.enable_tp:
-            hidden_states = tp._scatter_last_dim(hidden_states, self.tp_group_index, self.tp_slice_k, self.tp_comm_group)
-
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
 
         # 3 x [batch_size, seq_length, num_heads, head_dim]
