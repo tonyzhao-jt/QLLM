@@ -29,6 +29,7 @@ from transformers.models.bloom.modeling_bloom import (
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
 
+import qllm
 import qllm.tp as tp 
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
@@ -86,7 +87,6 @@ class BloomMLP(nn.Module):
         self.tp_slice_k = slice_k
 
         # partition along the head dim
-        self.head_dim = self.head_dim // slice_k
         self.broadcast = broadcast
 
 
@@ -106,6 +106,10 @@ class BloomMLP(nn.Module):
                 )
         else:
             intermediate_output = self.dense_4h_to_h(hidden_states)
+        
+        if self.enable_tp:
+            # gather result
+            intermediate_output = tp._all_reduce_sum(intermediate_output, self.tp_comm_group)
 
         output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
 
@@ -140,8 +144,15 @@ class BloomAttention(nn.Module):
 
         self.enable_tp = False
         self.tp_comm_group = None
+
+        self.profile = False
+
+        # kv related
+        self.kv_cache = {}
+        self.kv_status = {}
     
     def register_tp(self, bit, slice_k, index, caliber, tp_comm_group, broadcast=True):
+        assert len(self.kv_cache) == 0, "register_tp must be called before kv initialization"
         assert tp_comm_group is not None, "tp_comm_group must be specified"
         tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=tp_comm_group)
         tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=tp_comm_group)
@@ -158,7 +169,53 @@ class BloomAttention(nn.Module):
         # partition along the head dim
         self.head_dim = self.head_dim // slice_k
         self.broadcast = broadcast
+
+    @torch.no_grad()
+    def update_kv_cache(self, key_value_pair, request_id):
+        if len(self.kv_cache) == 0 or self.profile:
+            return 
+        # copy the key value pair to the cache
+        # self.kv_cache[layer_idx][request_id] = key_value_pair
+        prev_token_length = self.kv_status[request_id][0]
+        prompt_length = self.kv_status[request_id][1]
+        self.kv_cache[request_id][0][:, :, prev_token_length:prev_token_length + prompt_length].copy_(key_value_pair[0][:, :, prev_token_length:prev_token_length + prompt_length])
+        self.kv_cache[request_id][1][:, prev_token_length:prev_token_length + prompt_length, :].copy_(key_value_pair[1][:, prev_token_length:prev_token_length + prompt_length, :])
+        # update token length
+        self.kv_status[request_id][0] += 1
+
+    @torch.no_grad()
+    def get_kv_cache(self, request_id):
+        if len(self.kv_cache) == 0:
+            return None # not initialized
+        # based on the prompt_length + previous token length to fetch kv
+        prev_token_length = self.kv_status[request_id][0]
+        prompt_length = self.kv_status[request_id][1]
+        kv_output_length = prompt_length + prev_token_length - 1
+
+        if prev_token_length == 0:
+            return None
+        # for bloom
+            # concatenate along seq_length dimension:
+            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+        kv = (
+            self.kv_cache[request_id][0][:, :, :kv_output_length],
+            self.kv_cache[request_id][1][:, :kv_output_length, :]
+        )
+        return kv
     
+    @torch.no_grad()
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16):
+        max_seq_len = prompt_length + token_to_generate
+        k_shape = (b * self.num_heads, self.head_dim, max_seq_len)
+        v_shape = (b * self.num_heads, max_seq_len, self.head_dim)
+        params = list(self.query_key_value.parameters())
+        device = params[0].device
+        self.kv_cache[request_id] = (
+            torch.empty(k_shape, dtype=torch_dtype, device=device),
+            torch.empty(v_shape, dtype=torch_dtype, device=device)
+        ) 
+        self.kv_status[request_id] = [0, prompt_length]
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -207,10 +264,10 @@ class BloomAttention(nn.Module):
         residual: torch.Tensor,
         alibi: torch.Tensor,
         attention_mask: torch.Tensor,
-        layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         head_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         output_attentions: bool = False,
+        request_id: int = 1,
     ):
         if self.enable_tp and self.broadcast:
             tp._broad_cast(hidden_states, self.tp_comm_group) # broadcast hidden states
@@ -225,6 +282,7 @@ class BloomAttention(nn.Module):
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        layer_past = self.get_kv_cache(request_id) 
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
@@ -232,13 +290,11 @@ class BloomAttention(nn.Module):
             #  - value: [batch_size * self.num_heads, kv_length, head_dim]
             key_layer = torch.cat((past_key, key_layer), dim=2)
             value_layer = torch.cat((past_value, value_layer), dim=1)
+            
+        # update kv cache
+        self.update_kv_cache((key_layer, value_layer), request_id)
 
         _, _, kv_length = key_layer.shape
-
-        if use_cache is True:
-            present = (key_layer, value_layer)
-        else:
-            present = None
 
         # [batch_size * num_heads, q_length, kv_length]
         # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
@@ -293,9 +349,10 @@ class BloomAttention(nn.Module):
         
         output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
 
-        outputs = (output_tensor, present)
-        if output_attentions:
-            outputs += (attention_probs,)
+        outputs = (output_tensor, )
+        # outputs = (output_tensor, present)
+        # if output_attentions:
+        #     outputs += (attention_probs,)
 
         return outputs
 
@@ -405,6 +462,7 @@ class BloomBlockSharded(nn.Module):
                             elif 'dense' in k:
                                 unique_id = caliber.man_set_unique_id(self.self_attention.dense)
                                 caliber.man_set_module_calib_data(self.self_attention.dense, fake_calib_data)
+                
                 # quantize
                 if bit == "8:tc":
                     # remove the 8:tc for the moment, since it is not availble in small batchsize
@@ -412,9 +470,21 @@ class BloomBlockSharded(nn.Module):
                     bit = "8:tc-li"
                 if bit == "8:tc-li":
                     bit = 8
-                    quantize_linear_module_with_bit(self.self_attention, bit, caliber=caliber)
-                else:   
-                    quantize_linear_module_with_bit(self.self_attention, bit, caliber=None)
+                    use_calib = True
+                else:
+                    use_calib = False
+
+                # check if the tp_config is inside the shard_strategy
+                if 'tp_config' in shard_strategy:
+                    # quantize with tp sharding
+                    comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
+                    tp_config = shard_strategy['tp_config']
+                    index = tp_config['index']
+                    k = tp_config['k']
+                    self.self_attention.register_tp(bit, k, index, caliber, comm_group)
+                else:
+                    quantize_linear_module_with_bit(self.self_attention, bit, caliber=caliber) if use_calib else \
+                        quantize_linear_module_with_bit(self.self_attention, bit)
                 
             elif partition == 1:
                 bit = bits[idx]
@@ -434,20 +504,31 @@ class BloomBlockSharded(nn.Module):
                             unique_id = caliber.man_set_unique_id(self.mlp.dense_4h_to_h)
                             caliber.man_set_module_calib_data(self.mlp.dense_4h_to_h, fake_calib_data)
 
+                # quantize
                 if bit == "8:tc":
                     # remove the 8:tc for the moment, since it is not availble in small batchsize
                     print("use 8:tc-li instead" )
                     bit = "8:tc-li"
-                if bit == '8:tc-li':
-                    bit = 8
-                    quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber)
+                if bit == "8:tc-li":
+                    bit = 8                    
+                    use_calib = True
                 else:
-                    # logger.info("use non-kernel quantization for f1f2")
-                    # adaptive quantization for BITSANDBYTES and GPTQ
-                    quantize_linear_module_with_bit(self.mlp, bit, caliber=None)
-                
+                    use_calib = False
+
+                # check if the tp_config is inside the shard_strategy
+                if 'tp_config' in shard_strategy:
+                    # quantize with tp sharding
+                    comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
+                    tp_config = shard_strategy['tp_config']
+                    index = tp_config['index']
+                    k = tp_config['k']
+                    self.mlp.register_tp(bit, k, index, caliber, comm_group)
+                else:
+                    quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
+                        quantize_linear_module_with_bit(self.mlp, bit)
+
     @torch.no_grad()
-    def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, past_key_value, layer_head_mask, alibi=None, output_attentions=False, use_cache=False):
+    def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, alibi=None, request_id=1):
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
 
@@ -461,12 +542,11 @@ class BloomBlockSharded(nn.Module):
         attn_outputs = self.self_attention(
             layernorm_output,
             residual,
-            layer_past=past_key_value,
             attention_mask=attention_mask,
             alibi=alibi,
             head_mask=layer_head_mask,
-            use_cache=use_cache,
             output_attentions=False, # didn't ouput attention
+            request_id=request_id
         )
 
         attention_output = attn_outputs[0]
@@ -497,9 +577,8 @@ class BloomBlockSharded(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
         alibi: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        request_id: int = 1,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
         """
@@ -518,15 +597,13 @@ class BloomBlockSharded(nn.Module):
             past_key_value (`Tuple(torch.FloatTensor)`, *optional*): cached past key and value projection states
         """
         if 0 in self.partitions:
-            hidden_states = self.SELFATTEN_PART(hidden_states, attention_mask, past_key_value, head_mask, \
-                                                 alibi=alibi, output_attentions=output_attentions, use_cache=use_cache)
+            hidden_states = self.SELFATTEN_PART(hidden_states, attention_mask, head_mask, \
+                                                 alibi=alibi, request_id=request_id)
             # hidden states here are tuple
             if 1 in self.partitions:
-                if use_cache:
-                    present_key_value = hidden_states[1] # tuple of two tensors (k and v)
                 hidden_states = hidden_states[0]
                 outputs = self.FFN_PART(hidden_states)
-                return outputs if not use_cache else outputs + present_key_value
+                return outputs
             else:
                 return hidden_states
         # Fully Connected
@@ -697,90 +774,49 @@ class BloomModelSeq(BloomModel):
     # kv related operations
     @torch.no_grad()
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
-        if not hasattr(self, 'kv_cache'):
-            self.kv_cache = {}
-            self.kv_status = {}
-        max_seq_len = prompt_length + token_to_generate
-        for layer_idx, decoder_layer in enumerate(self.h):
-            if decoder_layer is None:
+
+        for idx, block in enumerate(self.h):
+            if block is None:
                 continue
-            if not decoder_layer.has_self_attention():
-                continue
-            torch_dtype = torch.float16
-            # TODO: temperoraily didn't consider the int8
-            # bits = decoder_layer.bits[0]
-            # if bits == '8:tc':
-            #     kv_bit = 8
-            #     torch_dtype = torch.int8
-            # else:
-            #     kv_bit = 16
-            #     torch_dtype = torch.float16
-            hidden_size, head_num = self.config.hidden_size, self.config.num_attention_heads
-            # size should be b x i x h
-            if layer_idx not in self.kv_cache:
-                self.kv_cache[layer_idx] = {}
-                self.kv_status[layer_idx] = {}
-            
-            # for bloom
-            # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-
-            k_shape = (b * head_num, hidden_size // head_num, max_seq_len)
-            v_shape = (b * head_num, max_seq_len, hidden_size // head_num)
-
-            self.kv_cache[layer_idx][request_id] = (
-                torch.empty(k_shape, dtype=torch_dtype, device=self.device),
-                torch.empty(v_shape, dtype=torch_dtype, device=self.device)
-            ) 
-
-            self.kv_status[layer_idx][request_id] = [0, prompt_length]
+            bits = block.bits[0]
+            if bits == '8:tc':
+                torch_dtype = torch.int8 # store in int8
+            else:
+                torch_dtype = torch.float16
+            if block.has_self_attention():
+                block.self_attention.init_kv_cache(b, prompt_length, token_to_generate, request_id, torch_dtype=torch_dtype)
     
     @torch.no_grad()
-    def update_kv_cache(self, layer_idx, key_value_pair, request_id):
-        if not hasattr(self, 'kv_cache'):
-            assert False, "kv_cache not initialized"
-        # copy the key value pair to the cache
-        # self.kv_cache[layer_idx][request_id] = key_value_pair
-        prev_token_length = self.kv_status[layer_idx][request_id][0]
-        prompt_length = self.kv_status[layer_idx][request_id][1]
-        self.kv_cache[layer_idx][request_id][0][:, :, prev_token_length:prev_token_length + prompt_length].copy_(key_value_pair[0][:, :, prev_token_length:prev_token_length + prompt_length])
-        self.kv_cache[layer_idx][request_id][1][:, prev_token_length:prev_token_length + prompt_length, :].copy_(key_value_pair[1][:, prev_token_length:prev_token_length + prompt_length, :])
-        # update token length
-        self.kv_status[layer_idx][request_id][0] += 1
-
-    @torch.no_grad()
-    def get_kv_cache(self, layer_idx, request_id):
-        if not hasattr(self, 'kv_cache'):
-            assert False, "kv_cache not initialized"
-        # based on the prompt_length + previous token length to fetch kv
-        prev_token_length = self.kv_status[layer_idx][request_id][0]
-        prompt_length = self.kv_status[layer_idx][request_id][1]
-        kv_output_length = prompt_length + prev_token_length - 1
-
-        if prev_token_length == 0:
-            return None
-        # for bloom
-            # concatenate along seq_length dimension:
-            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
-            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
-        kv = (
-            self.kv_cache[layer_idx][request_id][0][:, :, :kv_output_length],
-            self.kv_cache[layer_idx][request_id][1][:, :kv_output_length, :]
-        )
-        return kv
-    
-    def verbose_kv_cache(self):
-        print(self.kv_cache)
+    def get_all_kv_cache_dict(self, request_id=None):
+        return_dict = {}
+        for idx, block in enumerate(self.h):
+            if block is None:
+                continue
+            if block.has_self_attention():
+                if hasattr(block.self_attention, 'kv_cache'):
+                    if request_id is not None:
+                        return_dict[idx] = block.self_attention.kv_cache[request_id]
+                    else:
+                        return_dict[idx] = block.self_attention.kv_cache
+        return return_dict
     
     @torch.no_grad()
     def clear_request_kv_cache(self, request_id=1):
-        for layer_idx in self.kv_cache:
-            if request_id in self.kv_cache[layer_idx]:
-                del self.kv_cache[layer_idx][request_id]
+        for idx, block in enumerate(self.h):
+            if block is None:
+                continue
+            if block.has_self_attention():
+                if hasattr(block.self_attention, 'kv_cache'):
+                    del block.self_attention.kv_cache[request_id]
 
+    @torch.no_grad()
     def clear_all_kv_cache(self):
-        self.kv_cache = {}
+        for idx, block in enumerate(self.h):
+            if block is None:
+                continue
+            if block.has_self_attention():
+                if hasattr(block.self_attention, 'kv_cache'):
+                    block.self_attention.kv_cache = {}
 
     @torch.no_grad()
     def forward(
@@ -803,29 +839,14 @@ class BloomModelSeq(BloomModel):
             if block is None:
                 continue
 
-            past_key_value = None
-            if block.has_self_attention():
-                if hasattr(self, 'kv_cache'):
-                    past_key_value = self.get_kv_cache(idx, request_id)
-
             outputs = block(
                 hidden_states,
-                past_key_value=past_key_value,
                 attention_mask=attention_mask,
                 head_mask=head_mask[idx],
-                use_cache=use_cache,
                 output_attentions=output_attentions,
                 alibi=alibi,
+                request_id=request_id,
             )
-
-            if block.has_self_attention(): # store the kv together with the selfattn
-                if use_cache:
-                    # the output will contain a present key value
-                    if hasattr(self, 'kv_cache'):
-                        if type(outputs[1]) == tuple:
-                            self.update_kv_cache(idx, outputs[1], request_id)
-                        else:
-                            self.update_kv_cache(idx, outputs[1:], request_id) # update for further usage
 
             if block.is_only_self_attention():
                 hidden_states = (outputs[0], ) # 

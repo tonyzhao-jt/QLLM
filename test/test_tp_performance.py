@@ -133,12 +133,16 @@ weight_loaded_model = weight_loaded_model.cuda()
 batched_ids = {k: v.cuda() for k, v in batched_ids.items()}
 request_token = weight_loaded_model.preprocess(**batched_ids, use_cache=True, request_id=1)
 bloom_attn = weight_loaded_model.transformer.h[0].self_attention 
+bloom_mlp = weight_loaded_model.transformer.h[0].mlp
+
 hidden_size = bloom_attn.hidden_size
 hidden_states, causal_mask, head_mask, alibi, use_cache, request_id = request_token
 cnt_times = 10
 caliber.set_model(weight_loaded_model)
 caliber.set_fake()
 caliber.load_fake_calib_data('./fake_calib_bloom_1b1.pkl')
+
+# test attn
 if rank == 0:
     torch.cuda.synchronize()
     bloom_attn_cuda = bloom_attn.cuda()
@@ -173,4 +177,40 @@ if rank in group_ranks:
     end = perf_counter()
     if index == 0:
         print(f"bloom attn time, tp, bit {bit}", end - start)
+
+# test ffn
+if rank == 0:
+    torch.cuda.synchronize()
+    bloom_mlp_cuda = bloom_mlp.cuda()
+    # warmup
+    for _ in range(cnt_times):
+        fake_out = bloom_mlp_cuda(hidden_states, hidden_states)
+        torch.cuda.synchronize()
+    start = perf_counter()
+    for _ in range(cnt_times):
+        fake_out = bloom_mlp_cuda(hidden_states, hidden_states)
+        torch.cuda.synchronize()
+    end = perf_counter()
+    print("bloom mlp time, single", end - start)
+
+dist.barrier()
+if rank in group_ranks:
+    # start tp the mlp
+    index = group_ranks.index(rank)
+    bit = 16
+    # bloom_mlp.register_tp(8, slice_k, index, caliber, comm_group)
+    bloom_mlp.register_tp(bit, slice_k, index, caliber, comm_group)
+    bloom_mlp_cuda = bloom_mlp.cuda()
+    dist.barrier(group=comm_group)
+    # warmup
+    for _ in range(cnt_times):
+        out = bloom_mlp_cuda(hidden_states, hidden_states)
+        torch.cuda.synchronize()
+    start = perf_counter()
+    for _ in range(cnt_times):
+        out = bloom_mlp_cuda(hidden_states, hidden_states)
+        torch.cuda.synchronize()
+    end = perf_counter()
+    if index == 0:
+        print(f"bloom mlp time, tp, bit {bit}", end - start)
 

@@ -13,6 +13,8 @@ import torch
 import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
+from qllm.tp import utils as tp_utils
+
 if __name__ == '__main__':
     model_config = 'bigscience/bloom-560m'
     bloom_560m, tokenizer = bloom.load_pretained_model_from_net(model_config)
@@ -25,7 +27,8 @@ if __name__ == '__main__':
     
     weight_loaded_model = BloomForCausalLMSeq.from_pretrained(model_config, torch_dtype=torch.float16)
     print("decoder layernum", weight_loaded_model.get_decoder_layer_num())
-    
+
+
     sharding_strategy = {
         0: {
         },
@@ -49,6 +52,8 @@ if __name__ == '__main__':
             12: {'shard': [0,1], 'bits': [16, 16]},
             13: {'shard': [0,1], 'bits': [16, 16]},
             14: {'shard': [0,1], 'bits': [16, 16]},
+        },
+        3:{
             15: {'shard': [0,1], 'bits': [16, 16]},
             16: {'shard': [0,1], 'bits': [16, 16]},
             17: {'shard': [0,1], 'bits': [16, 16]},
@@ -61,6 +66,23 @@ if __name__ == '__main__':
         }
     }    
     
+    # Tp related.
+    # logic is like that: first, based on the TP group allocation, we init the tp group, and return the k and index value for each rank
+        # output is like: rank, index, k
+    # Then, we iterate the exisitng sharding strategies and updates them on to it.
+    res = tp_utils.register_tp_group()
+    if res is None:
+        pass
+    else:
+        # upate the sharding result
+        rank, index, k = res
+        if rank not in sharding_strategy:
+            pass 
+        else:
+            rank_cors_shards = sharding_strategy[rank]
+            for layer_idx, layer_spec in rank_cors_shards.items():
+                layer_spec['tp_config'] =  {"k": k, "index": index} # update the sharding strategy
+        
     # set calib results
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)

@@ -12,7 +12,7 @@ import lptorch
 import torch
 import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
-
+from qllm.tp import utils as tp_utils
 if __name__ == '__main__':
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
@@ -29,16 +29,18 @@ if __name__ == '__main__':
             1: {'shard': [0, 1], 'bits': [16, 16]},
             2: {'shard': [0, 1], 'bits': ['8:tc', '8:tc']},
             3: {'shard': [0, 1], 'bits': ['8:tc-li', 16]},
+        },
+        1:{
             4: {'shard': [0, 1], 'bits': [16, 4]},
             5: {'shard': [0, 1], 'bits': [16, 16]},
             6: {'shard': [0], 'bits': ['8:tc']},
         },
-        1: {
+        2: {
             6: {'shard': [1], 'bits': [16]},
             7: {'shard': [0,1], 'bits': [16, 16]},
             8: {'shard': [0,1], 'bits': [16, 16]},
         },
-        2: {
+        3: {
             9: {'shard': [0,1], 'bits': [16, 16]},
             10: {'shard': [0,1], 'bits': [16, 16]},
             11: {'shard': [0,1], 'bits': [16, 16]},
@@ -80,11 +82,24 @@ if __name__ == '__main__':
     #         23: {'shard': [0,1], 'bits': [16, 16]},
     #     }
     # }    
+    res = tp_utils.register_tp_group()
+    if res is None:
+        pass
+    else:
+        # upate the sharding result
+        rank, index, k = res
+        if rank not in sharding_strategy:
+            pass 
+        else:
+            rank_cors_shards = sharding_strategy[rank]
+            for layer_idx, layer_spec in rank_cors_shards.items():
+                layer_spec['tp_config'] =  {"k": k, "index": index} # update the sharding strategy
     
     # set calib results
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
-    caliber.load_calib_data('./opt_350M_calib_data.pkl')
+    caliber.set_fake()
+    caliber.load_fake_calib_data('./fake_calib_opt_350m.pkl')
 
     model_pre_and_post = weight_loaded_model._pure_pre_and_post()
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
@@ -182,6 +197,7 @@ if __name__ == '__main__':
     result_one_time2 = tokenizer.batch_decode(new_input_ids2, skip_special_tokens=True)
     print("Onetime Run: ", result_one_time)
     print("Onetime Run 2: ", result_one_time2)
+
     
 
 

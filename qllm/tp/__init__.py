@@ -2,6 +2,8 @@
 import torch.distributed as dist
 import torch 
 
+from . import utils
+
 def partition_a_into_b_bins(a, b):
     remainders = a % b
     ideal_allocation = a // b

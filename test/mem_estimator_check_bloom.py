@@ -66,7 +66,7 @@ if __name__ == '__main__':
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
     caliber.set_fake()
-    caliber.load_fake_calib_data('./fake_calib_bloom_560m.pkl')
+    caliber.load_fake_calib_data('./fake_calib_bloom_1b1.pkl')
 
     model_pre_and_post = weight_loaded_model._pure_pre_and_post()
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
@@ -176,9 +176,9 @@ if __name__ == '__main__':
     print("Estimated Model3", model_mem_estimator.calculate_model_occupation_of_partition(sharding_strategy[2], unit='MB')[1])
 
     # KV size
-    print("Model 1 KV size: ", get_iter_variable_size(model.transformer.kv_cache, unit='MB'))
-    print("Model 2 KV size: ", get_iter_variable_size(model_2.transformer.kv_cache, unit='MB'))
-    print("Model 3 KV size: ", get_iter_variable_size(model_3.transformer.kv_cache, unit='MB'))
+    print("Model 1 KV size: ", get_iter_variable_size(model.transformer.get_all_kv_cache_dict(), unit='MB'))
+    print("Model 2 KV size: ", get_iter_variable_size(model_2.transformer.get_all_kv_cache_dict(), unit='MB'))
+    print("Model 3 KV size: ", get_iter_variable_size(model_3.transformer.get_all_kv_cache_dict(), unit='MB'))
 
     # estimator
     print("Estimated Model1 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[0], 'MB')[0])
