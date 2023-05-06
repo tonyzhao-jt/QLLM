@@ -70,18 +70,7 @@ if __name__ == '__main__':
     # logic is like that: first, based on the TP group allocation, we init the tp group, and return the k and index value for each rank
         # output is like: rank, index, k
     # Then, we iterate the exisitng sharding strategies and updates them on to it.
-    res = tp_utils.register_tp_group()
-    if res is None:
-        pass
-    else:
-        # upate the sharding result
-        rank, index, k = res
-        if rank not in sharding_strategy:
-            pass 
-        else:
-            rank_cors_shards = sharding_strategy[rank]
-            for layer_idx, layer_spec in rank_cors_shards.items():
-                layer_spec['tp_config'] =  {"k": k, "index": index} # update the sharding strategy
+    res = tp_utils.register_tp_group_and_update_strategy([], sharding_strategy)
         
     # set calib results
     caliber = lptorch.inner_caliber

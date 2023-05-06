@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 import os 
 import qllm.tp as tp
+import qllm.tp.utils as qllm_tp_utils
 import qllm
 from qllm.models.BLOOM import BloomAttention, BloomForCausalLMSeq
 from qllm.models import bloom
@@ -23,12 +24,15 @@ world_size = dist.get_world_size()
 rank = dist.get_rank()
 local_rank = int(os.environ["LOCAL_RANK"])
 group_ranks = list(range(0, 4))
+group_ranks = [2, 3]
+
 slice_k = len(group_ranks)
 # set devivce
 torch.cuda.set_device(local_rank)
 
 # Create a new process group with the NCCL backend
-comm_group = dist.new_group(group_ranks, backend='nccl')
+qllm_tp_utils.register_tp_group(group_ranks)
+comm_group = qllm_tp_utils.get_tp_group()
 # PS: test ok.
 
 from lptorch import CalibHelper, quantize_one_linear_module, AdaQTPConfig
@@ -58,8 +62,8 @@ if rank == 0:
 if rank in group_ranks:
     index = group_ranks.index(rank)
 
-    tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=comm_group)
-    tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=comm_group)
+    tp_config_COL = AdaQTPConfig(split_k=slice_k, global_rank=rank, tp_index=index, split_type='COLUMN', comm_group=comm_group)
+    tp_config_ROW = AdaQTPConfig(split_k=slice_k, global_rank=rank, tp_index=index, split_type='ROW', comm_group=comm_group)
 
     col_li = quantize_one_linear_module(linear, kernel_bit=16, caliber=caliber, tp_config=tp_config_COL)
     row_li = quantize_one_linear_module(linear, kernel_bit=16, caliber=caliber, tp_config=tp_config_ROW)
@@ -84,17 +88,18 @@ if rank in group_ranks:
     '''
     for col-wise
     '''
-    tp._broad_cast(sample_x, comm_group)
+    tp._broad_cast(sample_x, rank, index, comm_group)
     col_li = col_li.cuda()
     res = col_li(sample_x)
     output = tp._all_gather(res, index, slice_k, comm_group)
     if index == 0:
         print("COL output shape", output.shape)
         print(torch.max(torch.abs(output - result)))
+
     '''
     for row-wise
     '''
-    sliced_x = tp._scatter_last_dim(sample_x, index, slice_k, comm_group)
+    sliced_x = tp._scatter_last_dim(sample_x, rank, index, slice_k, comm_group)
 
     row_li = row_li.cuda()
     res = row_li(sliced_x)
@@ -115,7 +120,6 @@ if rank in group_ranks:
 
 # block test.
 dist.barrier()
-
 if rank == 0:
     print("---- TEST BLOOM ----")
 
@@ -163,7 +167,7 @@ if rank in group_ranks:
     index = group_ranks.index(rank)
     bit = 16
     # bloom_attn.register_tp(8, slice_k, index, caliber, comm_group)
-    bloom_attn.register_tp(bit, slice_k, index, caliber, comm_group)
+    bloom_attn.register_tp(bit, caliber)
     bloom_attn_cuda = bloom_attn.cuda()
     dist.barrier(group=comm_group)
     # warmup
@@ -199,7 +203,7 @@ if rank in group_ranks:
     index = group_ranks.index(rank)
     bit = 16
     # bloom_mlp.register_tp(8, slice_k, index, caliber, comm_group)
-    bloom_mlp.register_tp(bit, slice_k, index, caliber, comm_group)
+    bloom_mlp.register_tp(bit, caliber)
     bloom_mlp_cuda = bloom_mlp.cuda()
     dist.barrier(group=comm_group)
     # warmup

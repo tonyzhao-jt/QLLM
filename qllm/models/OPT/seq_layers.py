@@ -31,6 +31,7 @@ import copy
 
 import qllm
 import qllm.tp as tp 
+import qllm.tp.utils as qllm_tp_utils
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
 from lptorch.utils import is_tensorcore_int8_available, get_capability
@@ -312,25 +313,33 @@ class OPTAttentionSeq(nn.Module):
         self.kv_cache = {}
         self.kv_status = {}
     
-    def register_tp(self, bit, slice_k, index, caliber, tp_comm_group, broadcast=True):
+    def register_tp(self, bit, caliber):
         assert len(self.kv_cache) == 0, "register_tp must be called before kv initialization"
-        assert tp_comm_group is not None, "tp_comm_group must be specified"
-        tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=tp_comm_group)
-        tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=tp_comm_group)
+
+        tp_config = qllm_tp_utils.get_tp_configs()
+        global_rank = tp_config['global_rank']
+        tp_index = tp_config['tp_index']
+        split_k = tp_config['split_k']
+        group = tp_config['group']
+        broadcast_group = tp_config['broadcast_group']
+        tp_config_COL = AdaQTPConfig(split_k=split_k, global_rank=global_rank, tp_index=tp_index, split_type='COLUMN', comm_group=group)
+        tp_config_ROW = AdaQTPConfig(split_k=split_k, global_rank=global_rank, tp_index=tp_index, split_type='ROW', comm_group=group)
+
         # first column then row
         self.k_proj = quantize_one_linear_module(self.k_proj, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
         self.v_proj = quantize_one_linear_module(self.v_proj, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
         self.q_proj = quantize_one_linear_module(self.q_proj, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
         self.out_proj = quantize_one_linear_module(self.out_proj, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
         # enable tp
-        self.tp_comm_group = tp_comm_group
         self.enable_tp = True
-        self.tp_group_index = index
-        self.tp_slice_k = slice_k
+        self.tp_comm_group = group
+        self.global_rank = global_rank
+        self.tp_index = tp_index
 
         # partition along the head dim
-        self.head_dim = self.head_dim // slice_k
-        self.broadcast = broadcast
+        self.head_dim = self.head_dim // split_k
+        self.broadcast = broadcast_group
+        self.embed_dim = self.embed_dim // split_k
     
 
     @torch.no_grad()
@@ -391,7 +400,7 @@ class OPTAttentionSeq(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         if self.enable_tp and self.broadcast:
-            tp._broad_cast(hidden_states, self.tp_comm_group) # broadcast hidden states
+            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, self.tp_comm_group) # broadcast hidden states
 
         past_key_value = self.get_kv_cache(request_id)
         # if key_value_states are provided this layer is used as a cross-attention layer
@@ -513,25 +522,31 @@ class OPTMLP(nn.Module):
         self.enable_tp = False
         self.tp_comm_group = None
 
-    def register_tp(self, bit, slice_k, index, caliber, tp_comm_group, broadcast=True):
-        assert tp_comm_group is not None, "tp_comm_group must be specified"
-        tp_config_COL = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='COLUMN', comm_group=tp_comm_group)
-        tp_config_ROW = AdaQTPConfig(split_k=slice_k, rank_index=index, split_type='ROW', comm_group=tp_comm_group)
+    def register_tp(self, bit, caliber, broadcast=True):
+        tp_config = qllm_tp_utils.get_tp_configs()
+        global_rank = tp_config['global_rank']
+        tp_index = tp_config['tp_index']
+        split_k = tp_config['split_k']
+        group = tp_config['group']
+        broadcast_group = tp_config['broadcast_group']
+        tp_config_COL = AdaQTPConfig(split_k=split_k, global_rank=global_rank, tp_index=tp_index, split_type='COLUMN', comm_group=group)
+        tp_config_ROW = AdaQTPConfig(split_k=split_k, global_rank=global_rank, tp_index=tp_index, split_type='ROW', comm_group=group)
         # first column then row
         self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
         self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
         # enable tp
-        self.tp_comm_group = tp_comm_group
+        self.tp_comm_group = group
         self.enable_tp = True
-        self.tp_group_index = index
-        self.tp_slice_k = slice_k
+        self.global_rank = global_rank
+        self.tp_index = tp_index
 
         # partition along the head dim
-        self.broadcast = broadcast
+        self.broadcast = broadcast_group
 
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.final_layer_norm(hidden_states)
         if self.enable_tp and self.broadcast:
-            tp._broad_cast(hidden_states, self.tp_comm_group) # broadcast hidden states
+            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, self.tp_comm_group) # broadcast hidden states
 
         hidden_states_shape = hidden_states.shape
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
@@ -539,8 +554,6 @@ class OPTMLP(nn.Module):
         #     if isinstance(self.final_layer_norm, LayerNormQ):
         #         hidden_states = hidden_states.to(torch.float32) # layernorm Q takes fp32
         #     hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.final_layer_norm(hidden_states)
-
         hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
@@ -548,7 +561,7 @@ class OPTMLP(nn.Module):
         # no drop out for inference
         if self.enable_tp:
             # gather result
-            hidden_state = tp._all_reduce_sum(hidden_state, self.tp_comm_group)
+            hidden_states = tp._all_reduce_sum(hidden_states, self.tp_comm_group)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = (residual + hidden_states.to(residual.dtype)).view(hidden_states_shape)
 
@@ -714,7 +727,7 @@ class OPTDecoderLayerSharded(nn.Module):
                     tp_config = shard_strategy['tp_config']
                     index = tp_config['index']
                     k = tp_config['k']
-                    self.self_attn.register_tp(bit, k, index, caliber, comm_group)
+                    self.self_attn.register_tp(bit, caliber)
                 else:
                     quantize_linear_module_with_bit(self.self_attn, bit, caliber=caliber) if use_calib else \
                         quantize_linear_module_with_bit(self.self_attn, bit)
@@ -773,7 +786,7 @@ class OPTDecoderLayerSharded(nn.Module):
                     tp_config = shard_strategy['tp_config']
                     index = tp_config['index']
                     k = tp_config['k']
-                    self.mlp.register_tp(bit, k, index, caliber, comm_group)
+                    self.mlp.register_tp(bit, caliber)
                 else:
                     quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
                         quantize_linear_module_with_bit(self.mlp, bit)
