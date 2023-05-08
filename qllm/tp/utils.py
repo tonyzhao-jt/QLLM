@@ -58,7 +58,6 @@ def get_tp_group():
     return qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
 
 def get_tp_configs():
-    assert qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__ is not None, "tp group is not initialized"
     config = {
         "group": qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__,
         "global_rank": qllm._globals.__TP__GLOBAL__RANK__,
