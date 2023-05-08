@@ -88,7 +88,7 @@ class BloomMLP(nn.Module):
         self.dense_4h_to_h = quantize_one_linear_module(self.dense_4h_to_h, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
         # enable tp
         self.enable_tp = True
-        self.tp_comm_group = group
+        # self.tp_comm_group = group
         self.global_rank = global_rank
         self.tp_index = tp_index
 
@@ -98,7 +98,8 @@ class BloomMLP(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         if self.enable_tp and self.broadcast:
-            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, self.tp_comm_group) # broadcast hidden states
+            group = qllm_tp_utils.get_tp_group()
+            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
             
         hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
 
@@ -115,7 +116,8 @@ class BloomMLP(nn.Module):
         
         if self.enable_tp:
             # gather result
-            intermediate_output = tp._all_reduce_sum(intermediate_output, self.tp_comm_group)
+            group = qllm_tp_utils.get_tp_group()
+            intermediate_output = tp._all_reduce_sum(intermediate_output, group)
 
         output = dropout_add(intermediate_output, residual, self.hidden_dropout, self.training)
 
@@ -173,7 +175,7 @@ class BloomAttention(nn.Module):
         self.dense = quantize_one_linear_module(self.dense, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
         # enable tp
         self.enable_tp = True
-        self.tp_comm_group = group
+        # self.tp_comm_group = group
         self.global_rank = global_rank
         self.tp_index = tp_index
 
@@ -281,7 +283,8 @@ class BloomAttention(nn.Module):
         request_id: int = 1,
     ):
         if self.enable_tp and self.broadcast:
-            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, self.tp_comm_group) # broadcast hidden states
+            group = qllm_tp_utils.get_tp_group()
+            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
         # when tensor parallel, split hidden_states at the front, gather at the end.
         fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
 
@@ -356,7 +359,8 @@ class BloomAttention(nn.Module):
 
         if self.enable_tp:
             # gather result
-            output_tensor = tp._all_reduce_sum(output_tensor, self.tp_comm_group)
+            group = qllm_tp_utils.get_tp_group()
+            output_tensor = tp._all_reduce_sum(output_tensor, group)
         
         output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
 

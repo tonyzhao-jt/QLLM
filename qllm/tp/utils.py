@@ -67,3 +67,17 @@ def get_tp_configs():
         'broadcast_group': qllm._globals.__TP__BROADCAST__GROUP__
     }
     return config
+
+def empty_tp_configs():
+    qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__ = None
+    qllm._globals.__TP__GLOBAL__RANK__ = None
+    qllm._globals.__TP__LOCAL_INDEX__ = None
+    qllm._globals.__TP__SMALL_WORLD_SIZE__ = None
+    qllm._globals.__TP__BROADCAST__GROUP__ = True
+
+def load_tp_configs(config):
+    qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__ = config['group']
+    qllm._globals.__TP__GLOBAL__RANK__ = config['global_rank']
+    qllm._globals.__TP__LOCAL_INDEX__ = config['tp_index']
+    qllm._globals.__TP__SMALL_WORLD_SIZE__ = config['split_k']
+    qllm._globals.__TP__BROADCAST__GROUP__ = config['broadcast_group']

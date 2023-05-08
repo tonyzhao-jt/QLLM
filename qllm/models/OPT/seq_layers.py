@@ -332,7 +332,7 @@ class OPTAttentionSeq(nn.Module):
         self.out_proj = quantize_one_linear_module(self.out_proj, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
         # enable tp
         self.enable_tp = True
-        self.tp_comm_group = group
+        # self.tp_comm_group = group
         self.global_rank = global_rank
         self.tp_index = tp_index
 
@@ -400,7 +400,8 @@ class OPTAttentionSeq(nn.Module):
         """Input shape: Batch x Time x Channel"""
 
         if self.enable_tp and self.broadcast:
-            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, self.tp_comm_group) # broadcast hidden states
+            group = qllm_tp_utils.get_tp_group()
+            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
 
         past_key_value = self.get_kv_cache(request_id)
         # if key_value_states are provided this layer is used as a cross-attention layer
@@ -502,7 +503,8 @@ class OPTAttentionSeq(nn.Module):
 
         if self.enable_tp:
             # gather result
-            attn_output = tp._all_reduce_sum(attn_output, self.tp_comm_group)
+            group = qllm_tp_utils.get_tp_group()
+            attn_output = tp._all_reduce_sum(attn_output, group)
 
         return attn_output
 
@@ -535,7 +537,7 @@ class OPTMLP(nn.Module):
         self.fc1 = quantize_one_linear_module(self.fc1, kernel_bit=bit, caliber=caliber, tp_config=tp_config_COL)
         self.fc2 = quantize_one_linear_module(self.fc2, kernel_bit=bit, caliber=caliber, tp_config=tp_config_ROW)
         # enable tp
-        self.tp_comm_group = group
+        # self.tp_comm_group = group
         self.enable_tp = True
         self.global_rank = global_rank
         self.tp_index = tp_index
@@ -546,7 +548,8 @@ class OPTMLP(nn.Module):
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         hidden_states = self.final_layer_norm(hidden_states)
         if self.enable_tp and self.broadcast:
-            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, self.tp_comm_group) # broadcast hidden states
+            group = qllm_tp_utils.get_tp_group()
+            tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
 
         hidden_states_shape = hidden_states.shape
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
@@ -561,7 +564,8 @@ class OPTMLP(nn.Module):
         # no drop out for inference
         if self.enable_tp:
             # gather result
-            hidden_states = tp._all_reduce_sum(hidden_states, self.tp_comm_group)
+            group = qllm_tp_utils.get_tp_group()
+            hidden_states = tp._all_reduce_sum(hidden_states, group)
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = (residual + hidden_states.to(residual.dtype)).view(hidden_states_shape)
 
