@@ -32,6 +32,7 @@ import copy
 import qllm
 import qllm.tp as tp 
 import qllm.tp.utils as qllm_tp_utils
+import qllm.nn as qllm_nn
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
 from lptorch.utils import is_tensorcore_int8_available, get_capability
@@ -1086,6 +1087,8 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             if device is not None:
                 self.layers[layer_idx] = self.layers[layer_idx].to(device)
     
+
+
     def load_layer_weight(self, shard_weight_dir):
         pass
         # for layer in self.layers:
@@ -1340,6 +1343,11 @@ class OPTForCausalLMSeq(OPTForCausalLM):
     def _pure_pre_and_post(self):
         sharded_model = copy.deepcopy(self)
         sharded_model.model.decoder._shard_decoders({}) # didn't delete the embeddings, etc.
+
+        sharded_model.model.decoder.embed_tokens = qllm_nn.Embedding1D.from_embed(sharded_model.model.decoder.embed_tokens)
+        # don't handle the positional embedding, since it is small. follow collosal implementation
+        # handle the lm_head
+        self.lm_head = qllm_nn.Classifier1D.from_classi(self.lm_head, broadcast=True)
         return sharded_model
 
     # return model instance with copy

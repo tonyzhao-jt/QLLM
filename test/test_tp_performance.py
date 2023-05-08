@@ -13,6 +13,7 @@ import os
 import qllm.tp as tp
 import qllm.tp.utils as qllm_tp_utils
 import qllm
+import qllm.nn as qllm_nn
 from qllm.models.BLOOM import BloomAttention, BloomForCausalLMSeq
 from qllm.models import bloom
 from time import perf_counter
@@ -23,6 +24,7 @@ dist.init_process_group(backend='gloo', init_method='env://')
 world_size = dist.get_world_size()
 rank = dist.get_rank()
 local_rank = int(os.environ["LOCAL_RANK"])
+local_device = torch.device('cuda', local_rank)
 group_ranks = list(range(0, 4))
 group_ranks = [2, 3]
 
@@ -62,11 +64,9 @@ if rank == 0:
 if rank in group_ranks:
     index = group_ranks.index(rank)
 
-    tp_config_COL = AdaQTPConfig(split_k=slice_k, global_rank=rank, tp_index=index, split_type='COLUMN', comm_group=comm_group)
-    tp_config_ROW = AdaQTPConfig(split_k=slice_k, global_rank=rank, tp_index=index, split_type='ROW', comm_group=comm_group)
-
-    col_li = quantize_one_linear_module(linear, kernel_bit=16, caliber=caliber, tp_config=tp_config_COL)
-    row_li = quantize_one_linear_module(linear, kernel_bit=16, caliber=caliber, tp_config=tp_config_ROW)
+    col_li = qllm_nn.Linear1D.from_linear(linear, TP_TYPE='COLUMN')
+    row_li = qllm_nn.Linear1D.from_linear(linear)
+    classify = qllm_nn.Classifier1D.from_classi(linear, broadcast=True)
 
     # quantize linear
     print("rank", rank, slice_k, index)
@@ -81,9 +81,16 @@ if rank in group_ranks:
         # print(qllm._globals.HIDDEN_STATE_TENSOR_SHAPE)
         sample_x = torch.empty(qllm._globals.HIDDEN_STATE_TENSOR_SHAPE).cuda().half()
     
-    '''
+
     
     '''
+        Classify
+    '''
+    classify = classify.cuda()
+    output = classify(sample_x)
+    if index == 0:
+        print("Classify output shape", output.shape)
+        print(torch.max(torch.abs(output - result)))
 
     '''
     for col-wise
@@ -106,18 +113,31 @@ if rank in group_ranks:
     # print(sliced_x, row_li.inner_layer.weight, index)
     # do all_reduce
     # print(res, "result", index)
-    res = tp._all_reduce_sum(res, comm_group)
+    # res = tp._all_reduce_sum(res, comm_group) all reduce is added in the forward function
     dist.barrier(group=comm_group)
     if index == 0:
         print("ROW output shape", res.shape)
         print(torch.max(torch.abs(res - result)))
-        # print("output", res)
-        # print("result", result)
-        # print(linear.weight, sample_x)
-        # print(linear.bias)
-        # print(res, result)
-    
 
+# also test a sample embedding result
+test_emb = torch.nn.Embedding(200, 200)
+test_emb = test_emb.to(local_device)
+test_emb_input = torch.tensor([1, 2, 4,101,134]).to(local_device)
+if rank == group_ranks[0]:
+    test_emb_out = test_emb(test_emb_input)
+# broadcast weight
+rank_0_weight = test_emb.weight.detach().clone()
+if rank in group_ranks:
+    index = group_ranks.index(rank)
+    tp._broad_cast(rank_0_weight, rank, index, comm_group)
+    test_emb.weight.data.copy_(rank_0_weight) # change weight data
+    local_embed = qllm_nn.Embedding1D.from_embed(test_emb)
+
+    local_embed_out = local_embed(test_emb_input)
+    if rank == group_ranks[0]:
+        print(torch.max(torch.abs(local_embed_out - test_emb_out)))
+
+exit()
 # block test.
 dist.barrier()
 if rank == 0:
