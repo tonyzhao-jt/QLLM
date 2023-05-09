@@ -16,7 +16,7 @@ import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
 if __name__ == '__main__':
-    model_config = 'bigscience/bloom-1b1'
+    model_config = 'bigscience/bloom-560m'
     bloom_560m, tokenizer = bloom.load_pretained_model_from_net(model_config)
     # sample text
     max_length = 512
@@ -66,7 +66,7 @@ if __name__ == '__main__':
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
     caliber.set_fake()
-    caliber.load_fake_calib_data('./fake_calib_bloom_1b1.pkl')
+    caliber.load_fake_calib_data('./fake_calib_bloom_560m.pkl')
 
     model_pre_and_post = weight_loaded_model._pure_pre_and_post()
     model = weight_loaded_model.shard_model(sharding_strategy, 0)

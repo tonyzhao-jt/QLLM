@@ -32,6 +32,7 @@ logger = logging.get_logger(__name__)
 import qllm
 import qllm.tp as tp 
 import qllm.tp.utils as qllm_tp_utils
+import qllm.nn as qllm_nn
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
 from lptorch.utils import is_tensorcore_int8_available, get_capability
@@ -630,7 +631,8 @@ class BloomBlockSharded(nn.Module):
 # act like OPTDecoder in usage.
 class BloomModelSeq(BloomModel):
     def __init__(self, config: BloomConfig):
-        super().__init__(config)
+        with init_empty_weights():
+            super().__init__(config)
 
         self.embed_dim = config.hidden_size
         self.num_heads = config.n_head
@@ -980,6 +982,10 @@ class BloomForCausalLMSeq(BloomForCausalLM):
     def _pure_pre_and_post(self):
         sharded_model = copy.deepcopy(self)
         sharded_model.transformer._shard_decoders({}) # didn't delete the embeddings, etc.
+        sharded_model.transformer.word_embeddings = qllm_nn.Embedding1D.from_embed(sharded_model.transformer.word_embeddings)
+        # don't handle the positional embedding, since it is small. follow collosal implementation
+        # handle the lm_head
+        self.lm_head = qllm_nn.Classifier1D.from_classi(self.lm_head, broadcast=True)
         return sharded_model
 
     # return model instance with copy
