@@ -30,6 +30,7 @@ from dataclasses import dataclass
 import copy
 
 import qllm
+import qllm.utils as qllm_utils
 import qllm.tp as tp 
 import qllm.tp.utils as qllm_tp_utils
 import qllm.nn as qllm_nn
@@ -347,6 +348,8 @@ class OPTAttentionSeq(nn.Module):
     def update_kv_cache(self, key_value_pair, request_id):
         if len(self.kv_cache) == 0 or self.profile:
             return 
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         # copy the key value pair to the cache
         # self.kv_cache[layer_idx][request_id] = key_value_pair
         prev_token_length = self.kv_status[request_id][0]
@@ -360,6 +363,8 @@ class OPTAttentionSeq(nn.Module):
     def get_kv_cache(self, request_id):
         if len(self.kv_cache) == 0:
             return None # not initialized
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         # based on the prompt_length + previous token length to fetch kv
         prev_token_length = self.kv_status[request_id][0]
         prompt_length = self.kv_status[request_id][1]
@@ -383,6 +388,8 @@ class OPTAttentionSeq(nn.Module):
         kv_shape_2 = (b, self.num_heads, max_seq_len, self.head_dim, 2)
         params = list(self.q_proj.parameters())
         device = params[0].device
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         self.kv_cache[request_id] = torch.empty(kv_shape_2, dtype=torch_dtype, device=device)
         self.kv_status[request_id] = [0, prompt_length]
 
@@ -1275,6 +1282,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
                 next_token_embeds = self.model.decoder.project_in(next_token_embeds)
             next_token_embeds = next_token_embeds + p_embeds
             request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id)
+            request_token = qllm_utils.object_to_tensor(request_token)
             return request_token
     
     @torch.no_grad()
@@ -1308,7 +1316,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, )
 
         self.return_dict = return_dict
-
+        pre_result = qllm_utils.object_to_tensor(pre_result)
         return pre_result
     
     def get_decoder_layer_num(self):
@@ -1369,16 +1377,21 @@ class OPTForCausalLMSeq(OPTForCausalLM):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
             attention_mask, head_mask, use_cache, request_id = prev_result[1:]
+
+            p_head_mask = qllm_utils.return_none_if_nan(head_mask)
+            p_attention_mask = qllm_utils.return_none_if_nan(attention_mask)
+
             res = module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,
-                attention_mask=attention_mask,
-                head_mask=head_mask,
+                attention_mask=p_attention_mask,
+                head_mask=p_head_mask,
                 past_key_values=None,
                 use_cache=use_cache,
                 request_id=request_id,
             )
-            return res
+            # return res
+            return (res[0],) + prev_result[1:]
 
         return shard_launcher(pre_result, self.model.decoder)
 

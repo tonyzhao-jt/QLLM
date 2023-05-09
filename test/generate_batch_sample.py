@@ -164,6 +164,7 @@ if __name__ == '__main__':
 
     original_token = copy.deepcopy(input_ids)
     input_ids2 = copy.deepcopy(input_ids)
+
     for i in range(num_tokens_to_generate):
         new_input_ids, next_token = generate_one_token(request_token, input_ids)
         new_input_ids2, next_token2 = generate_one_token(request_token2, input_ids2)

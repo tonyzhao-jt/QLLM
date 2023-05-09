@@ -5,3 +5,4 @@ from .param_status import get_iter_variable_size
 from .mem_estimator import ModelMemEstimator
 from .device_precision import get_available_bits, get_available_bits_offline
 from .simple_partition import partition_a_into_b_bins
+from .tensor_handler import object_to_tensor, return_none_if_nan

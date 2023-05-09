@@ -31,6 +31,7 @@ logger = logging.get_logger(__name__)
 
 import qllm
 import qllm.tp as tp 
+import qllm.utils as qllm_utils
 import qllm.tp.utils as qllm_tp_utils
 import qllm.nn as qllm_nn
 import lptorch
@@ -188,6 +189,8 @@ class BloomAttention(nn.Module):
     def update_kv_cache(self, key_value_pair, request_id):
         if len(self.kv_cache) == 0 or self.profile:
             return 
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         # copy the key value pair to the cache
         # self.kv_cache[layer_idx][request_id] = key_value_pair
         prev_token_length = self.kv_status[request_id][0]
@@ -201,6 +204,8 @@ class BloomAttention(nn.Module):
     def get_kv_cache(self, request_id):
         if len(self.kv_cache) == 0:
             return None # not initialized
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         # based on the prompt_length + previous token length to fetch kv
         prev_token_length = self.kv_status[request_id][0]
         prompt_length = self.kv_status[request_id][1]
@@ -220,6 +225,8 @@ class BloomAttention(nn.Module):
     
     @torch.no_grad()
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16):
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         max_seq_len = prompt_length + token_to_generate
         k_shape = (b * self.num_heads, self.head_dim, max_seq_len)
         v_shape = (b * self.num_heads, max_seq_len, self.head_dim)
@@ -791,7 +798,8 @@ class BloomModelSeq(BloomModel):
     # kv related operations
     @torch.no_grad()
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id):
-
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
         for idx, block in enumerate(self.h):
             if block is None:
                 continue
@@ -914,6 +922,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
             )
             mask_and_cache = (causal_mask, head_mask, alibi, use_cache) 
             request_token = (hidden_states,) + mask_and_cache + (request_id, )
+            request_token = qllm_utils.object_to_tensor(request_token)
             return request_token
     
     @torch.no_grad()
@@ -948,7 +957,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         use_cache = use_cache
         mask_and_cache = (attention_mask, head_mask, alibi, use_cache) 
         pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, )
-
+        pre_result = qllm_utils.object_to_tensor(pre_result)
         return pre_result
     
     def get_decoder_layer_num(self):
@@ -1007,17 +1016,19 @@ class BloomForCausalLMSeq(BloomForCausalLM):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
             attention_mask, head_mask, alibi, use_cache, request_id = prev_result[1:]
+            p_head_mask = qllm_utils.return_none_if_nan(head_mask)
+            p_attention_mask = qllm_utils.return_none_if_nan(attention_mask)
             res = module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,
-                attention_mask=attention_mask,
-                head_mask=head_mask,
+                attention_mask=p_attention_mask,
+                head_mask=p_head_mask,
                 past_key_values=None,
                 use_cache=use_cache,
                 alibi=alibi,
                 request_id=request_id,
             )
-            return res
+            return (res[0],) + prev_result[1:]
 
         return shard_launcher(pre_result, self.transformer)
 
