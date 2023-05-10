@@ -4,3 +4,6 @@
 [submodule "3rd_party/transformers"]
 	path = 3rd_party/transformers
 	url = https://github.com/huggingface/transformers.git
+[submodule "3rd_party/ColossalAI"]
+	path = 3rd_party/ColossalAI
+	url = https://github.com/hpcaitech/ColossalAI.git

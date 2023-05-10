@@ -12,11 +12,12 @@ def register_tp_group(group_ranks=[]):
     # by default, use all local devices
     if len(group_ranks) == 0:
         group_ranks = list(range(0, local_world_size))
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
     if not dist.is_initialized():
         # Initialize the distributed environment
-        dist.init_process_group(backend='nccl')
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
     comm_group = dist.new_group(group_ranks, backend='nccl')
-    rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     if rank not in group_ranks:
         return None
