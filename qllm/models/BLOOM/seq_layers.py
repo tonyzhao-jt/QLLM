@@ -26,9 +26,10 @@ from transformers.models.bloom.modeling_bloom import (
     BloomBlock,
     BloomGelu
 )
+import math
 from transformers.utils import logging
 logger = logging.get_logger(__name__)
-
+import os 
 import qllm
 import qllm.tp as tp 
 import qllm.utils as qllm_utils
@@ -36,10 +37,17 @@ import qllm.tp.utils as qllm_tp_utils
 import qllm.nn as qllm_nn
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
-from lptorch.utils import is_tensorcore_int8_available, get_capability
+from lptorch.utils import is_tensorcore_int8_available, get_capability, init_weight_bias_with_rand
 cap = get_capability()
 
-import math
+if cap >= 80:
+    from lptorch.torch_int.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+    from lptorch.torch_int.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+    from lptorch.torch_int.nn.fused import LayerNormQ
+else:
+    from lptorch.lptorch.nn.bmm import BMM_S8T_S8N_S8T, BMM_S8T_S8N_F32T
+    from lptorch.lptorch.nn.linear import W8A8BFP32OFP32Linear, W8A8B8O8Linear, W8A8B8O8LinearReLU
+    from lptorch.lptorch.nn.fused import LayerNormQ
 
 def dropout_add(x: torch.Tensor, residual: torch.Tensor, prob: float, training: bool) -> torch.Tensor:
     """
@@ -102,8 +110,10 @@ class BloomMLP(nn.Module):
         if self.enable_tp and self.broadcast:
             group = qllm_tp_utils.get_tp_group()
             tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
-            
+        
+        hidden_states_dtype = hidden_states.dtype
         hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
+        hidden_states = hidden_states.to(hidden_states_dtype)
 
         if self.pretraining_tp > 1 and self.slow_but_exact:
             intermediate_output = torch.zeros_like(residual)
@@ -128,7 +138,7 @@ class BloomMLP(nn.Module):
 class BloomAttention(nn.Module):
     def __init__(self, config: BloomConfig):
         super().__init__()
-
+        self.config = config
         self.pretraining_tp = config.pretraining_tp
         self.slow_but_exact = config.slow_but_exact
 
@@ -187,7 +197,7 @@ class BloomAttention(nn.Module):
 
     @torch.no_grad()
     def update_kv_cache(self, key_value_pair, request_id):
-        if len(self.kv_cache) == 0 or self.profile:
+        if len(self.kv_cache) == 0:
             return 
         if isinstance(request_id, torch.Tensor):
             request_id = request_id.item()
@@ -195,10 +205,12 @@ class BloomAttention(nn.Module):
         # self.kv_cache[layer_idx][request_id] = key_value_pair
         prev_token_length = self.kv_status[request_id][0]
         prompt_length = self.kv_status[request_id][1]
-        self.kv_cache[request_id][0][:, :, prev_token_length:prev_token_length + prompt_length].copy_(key_value_pair[0][:, :, prev_token_length:prev_token_length + prompt_length])
-        self.kv_cache[request_id][1][:, prev_token_length:prev_token_length + prompt_length, :].copy_(key_value_pair[1][:, prev_token_length:prev_token_length + prompt_length, :])
+        cur_token_length = prev_token_length + prompt_length - 1
+        self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+        self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
         # update token length
-        self.kv_status[request_id][0] += 1
+        if not self.profile:
+            self.kv_status[request_id][0] += 1
 
     @torch.no_grad()
     def get_kv_cache(self, request_id):
@@ -224,7 +236,7 @@ class BloomAttention(nn.Module):
         return kv
     
     @torch.no_grad()
-    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16):
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16, init_with_xavier=False):
         if isinstance(request_id, torch.Tensor):
             request_id = request_id.item()
         max_seq_len = prompt_length + token_to_generate
@@ -236,6 +248,9 @@ class BloomAttention(nn.Module):
             torch.empty(k_shape, dtype=torch_dtype, device=device),
             torch.empty(v_shape, dtype=torch_dtype, device=device)
         ) 
+        if init_with_xavier:
+            nn.init.xavier_uniform_(self.kv_cache[request_id][0])
+            nn.init.xavier_uniform_(self.kv_cache[request_id][1])
         self.kv_status[request_id] = [0, prompt_length]
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -380,6 +395,279 @@ class BloomAttention(nn.Module):
         return outputs
 
 
+class Int8BLOOMAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: BloomConfig):
+        super().__init__()
+        self.pretraining_tp = config.pretraining_tp
+        self.slow_but_exact = config.slow_but_exact
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.n_head
+        self.head_dim = self.hidden_size // self.num_heads
+        self.split_size = self.hidden_size
+        self.hidden_dropout = config.hidden_dropout
+
+        if self.head_dim * self.num_heads != self.hidden_size:
+            raise ValueError(
+                f"`hidden_size` must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and `num_heads`:"
+                f" {self.num_heads})."
+            )
+
+        # Layer-wise attention scaling
+        self.inv_norm_factor = 1.0 / math.sqrt(self.head_dim)
+        self.beta = 1.0
+
+        self.query_key_value = W8A8B8O8Linear(self.hidden_size, 3 * self.hidden_size)
+        self.dense = W8A8BFP32OFP32Linear(self.hidden_size, self.hidden_size)
+        self.attention_dropout = nn.Dropout(config.attention_dropout)
+
+        self.attention_weight_scale = 1.0
+
+        self.fwd_tokenizer = ForwardTokenizer(16, 8)
+
+
+        self.enable_tp = False
+        self.tp_comm_group = None
+
+
+        self.enable_tp = False
+        self.tp_comm_group = None
+
+        # profile usage
+        self.profile = False
+
+        # kv related
+        self.kv_cache = {}
+        self.kv_status = {}
+
+    @staticmethod
+    @torch.no_grad()
+    def from_float(module: BloomAttention,
+                   input_scale: float,
+                   qkv_output_scale: float,
+                   dense_scale: float):
+        perf_mode = os.environ['PERF_MODE'] == "1"
+        if perf_mode:
+            logger.info("perf mode is enabled")
+            input_scale = qkv_output_scale = dense_scale = 1.0
+        int8_module = Int8BLOOMAttention(module.config)
+        # Fuse the scaling into the q_proj output scale
+        qkv_output_scale = qkv_output_scale *  module.inv_norm_factor
+        module.query_key_value.weight *= module.inv_norm_factor
+        module.query_key_value.bias *= module.inv_norm_factor
+        int8_module.query_key_value = W8A8B8O8Linear.from_float(
+            module.query_key_value, input_scale, qkv_output_scale)
+        int8_module.dense = W8A8BFP32OFP32Linear.from_float(
+            module.dense, dense_scale)
+        if perf_mode:
+            # randomly init all weight involved
+            init_weight_bias_with_rand(int8_module.query_key_value)
+            init_weight_bias_with_rand(int8_module.dense)
+
+        int8_module.qkv_output_scale = qkv_output_scale
+        int8_module.dense_scale = dense_scale
+        return int8_module
+
+    @torch.no_grad()
+    def update_kv_cache(self, key_value_pair, request_id):
+        if len(self.kv_cache) == 0:
+            return 
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
+        # copy the key value pair to the cache
+        # self.kv_cache[layer_idx][request_id] = key_value_pair
+        prev_token_length = self.kv_status[request_id][0]
+        prompt_length = self.kv_status[request_id][1]
+        cur_token_length = prev_token_length + prompt_length - 1
+        self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+        self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+        # update token length
+        if not self.profile:
+            self.kv_status[request_id][0] += 1
+
+    @torch.no_grad()
+    def get_kv_cache(self, request_id):
+        if len(self.kv_cache) == 0:
+            return None # not initialized
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
+        # based on the prompt_length + previous token length to fetch kv
+        prev_token_length = self.kv_status[request_id][0]
+        prompt_length = self.kv_status[request_id][1]
+        kv_output_length = prompt_length + prev_token_length - 1
+
+        if prev_token_length == 0:
+            return None
+        # for bloom
+            # concatenate along seq_length dimension:
+            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+        kv = (
+            self.kv_cache[request_id][0][:, :, :kv_output_length],
+            self.kv_cache[request_id][1][:, :kv_output_length, :]
+        )
+        return kv
+    
+    @torch.no_grad()
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16, init_with_xavier=False):
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
+        max_seq_len = prompt_length + token_to_generate
+        k_shape = (b * self.num_heads, self.head_dim, max_seq_len)
+        v_shape = (b * self.num_heads, max_seq_len, self.head_dim)
+        # params = list(self.query_key_value.parameters())
+        device = self.query_key_value.weight.device
+        self.kv_cache[request_id] = (
+            torch.empty(k_shape, dtype=torch_dtype, device=device),
+            torch.empty(v_shape, dtype=torch_dtype, device=device)
+        ) 
+        if init_with_xavier:
+            nn.init.xavier_uniform_(self.kv_cache[request_id][0])
+            nn.init.xavier_uniform_(self.kv_cache[request_id][1])
+        self.kv_status[request_id] = [0, prompt_length]
+
+
+    def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
+        return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    
+    def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Split the last dimension into (num_heads, head_dim) without making any copies, results share same memory
+        storage as `fused_qkv`
+
+        Args:
+            fused_qkv (`torch.tensor`, *required*): [batch_size, seq_length, num_heads * 3 * head_dim]
+
+        Returns:
+            query: [batch_size, seq_length, num_heads, head_dim] key: [batch_size, seq_length, num_heads, head_dim]
+            value: [batch_size, seq_length, num_heads, head_dim]
+        """
+        batch_size, seq_length, three_times_hidden_size = fused_qkv.shape
+        fused_qkv = fused_qkv.view(batch_size, seq_length, self.num_heads, 3, self.head_dim)
+        return fused_qkv[..., 0, :], fused_qkv[..., 1, :], fused_qkv[..., 2, :]
+
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Merge heads together over the last dimenstion
+
+        Args:
+            x: (`torch.tensor`, *required*): [batch_size * num_heads, seq_length, head_dim]
+
+        Returns:
+            torch.tensor: [batch_size, seq_length, num_heads * head_dim]
+        """
+        # What we want to achieve is:
+        # batch_size * num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads * head_dim
+        batch_size_and_num_heads, seq_length, _ = x.shape
+        batch_size = batch_size_and_num_heads // self.num_heads
+
+        # First view to decompose the batch size
+        # batch_size * num_heads, seq_length, head_dim -> batch_size, num_heads, seq_length, head_dim
+        x = x.view(batch_size, self.num_heads, seq_length, self.head_dim)
+
+        # batch_size, num_heads, seq_length, head_dim -> batch_size, seq_length, num_heads, head_dim
+        x = x.permute(0, 2, 1, 3)
+
+        # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
+        return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
+    
+    @torch.no_grad()
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        alibi: torch.Tensor,
+        attention_mask: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+        output_attentions: bool = False,
+        request_id: int = 1,
+    )  -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+
+        if hidden_states.dtype != torch.int8:
+            hidden_states = self.fwd_tokenizer(hidden_states)
+
+        fused_qkv = self.query_key_value(hidden_states)  # [batch_size, seq_length, 3 x hidden_size]
+
+        # 3 x [batch_size, seq_length, num_heads, head_dim]
+        (query_layer, key_layer, value_layer) = self._split_heads(fused_qkv)
+
+        batch_size, q_length, _, _ = query_layer.shape
+
+        query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
+        value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
+        layer_past = self.get_kv_cache(request_id) 
+        if layer_past is not None:
+            past_key, past_value = layer_past
+            # concatenate along seq_length dimension:
+            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+            key_layer = torch.cat((past_key, key_layer), dim=2)
+            value_layer = torch.cat((past_value, value_layer), dim=1)
+
+        past_key_value = (key_layer, value_layer)
+        self.update_kv_cache(past_key_value, request_id)
+
+        _, _, kv_length = key_layer.shape
+
+        query_layer = query_layer.half().contiguous() * self.qkv_output_scale
+        key_layer = key_layer.half().contiguous() * self.qkv_output_scale
+        value_layer = value_layer.half().contiguous() * self.qkv_output_scale * 127 / self.dense_scale
+
+        # [batch_size * num_heads, q_length, kv_length]
+        # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
+        matmul_result = alibi.baddbmm(
+            batch1=query_layer,
+            batch2=key_layer,
+            beta=self.beta,
+            alpha=self.inv_norm_factor,
+        )
+
+        # change view to [batch_size, num_heads, q_length, kv_length]
+        attention_scores = matmul_result.view(batch_size, self.num_heads, q_length, kv_length)
+
+        # cast attention scores to fp32, compute scaled softmax and cast back to initial dtype - [batch_size, num_heads, q_length, kv_length]
+        input_dtype = attention_scores.dtype
+        # `float16` has a minimum value of -65504.0, whereas `bfloat16` and `float32` have a minimum value of `-3.4e+38`
+        if input_dtype == torch.float16:
+            attention_scores = attention_scores.to(torch.float)
+        attn_weights = torch.masked_fill(attention_scores, attention_mask, torch.finfo(attention_scores.dtype).min)
+        attention_probs = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(input_dtype)
+
+        # [batch_size, num_heads, q_length, kv_length]
+        attention_probs = self.attention_dropout(attention_probs)
+
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+
+        # change view [batch_size x num_heads, q_length, kv_length]
+        attention_probs_reshaped = attention_probs.view(batch_size * self.num_heads, q_length, kv_length)
+
+        # matmul: [batch_size * num_heads, q_length, head_dim]
+        context_layer = torch.bmm(attention_probs_reshaped, value_layer)
+
+        # change view [batch_size, num_heads, q_length, head_dim]
+        context_layer = self._merge_heads(context_layer)
+        scale = self.qkv_output_scale *  127 / self.dense_scale
+        context_layer = (scale * context_layer).to(torch.int8)
+        output_tensor = self.dense(context_layer)
+
+        if self.enable_tp:
+            # gather result
+            group = qllm_tp_utils.get_tp_group()
+            output_tensor = tp._all_reduce_sum(output_tensor, group)
+        
+        output_tensor = dropout_add(output_tensor, residual, self.hidden_dropout, self.training)
+        output_tensor = output_tensor.half() # convert to half at the end
+        outputs = (output_tensor, )
+        # outputs = (output_tensor, present)
+        # if output_attentions:
+        #     outputs += (attention_probs,)
+
+        return outputs
+
 class BloomBlockSharded(nn.Module):
     def __init__(self, config: BloomConfig):
         super().__init__()
@@ -486,28 +774,33 @@ class BloomBlockSharded(nn.Module):
                                 unique_id = caliber.man_set_unique_id(self.self_attention.dense)
                                 caliber.man_set_module_calib_data(self.self_attention.dense, fake_calib_data)
                 
-                # quantize
-                if bit == "8:tc":
-                    # remove the 8:tc for the moment, since it is not availble in small batchsize
-                    print("use 8:tc-li instead" )
-                    bit = "8:tc-li"
-                if bit == "8:tc-li":
-                    bit = 8
-                    use_calib = True
+                if bit == "8:tc": # tensorcore int8
+                    assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attention.query_key_value) is not None, \
+                        "Tensorcore is not available on this GPU, or the calibration data is not available"
+                    qkv_input_scale, qkv_out_scale = caliber.get_module_calib_data(self.self_attention.query_key_value)
+                    _, dense_scale = caliber.get_module_calib_data(self.self_attention.dense)
+                    self.self_attention = Int8BLOOMAttention.from_float(
+                        self.self_attention, qkv_input_scale, qkv_out_scale, dense_scale=dense_scale)
+                    
+                    self.input_layernorm = LayerNormQ.from_float(self.input_layernorm, qkv_input_scale)
                 else:
-                    use_calib = False
+                    if bit == "8:tc-li":
+                        bit = 8
+                        use_calib = True
+                    else:
+                        use_calib = False
 
-                # check if the tp_config is inside the shard_strategy
-                if 'tp_config' in shard_strategy:
-                    # quantize with tp sharding
-                    comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
-                    tp_config = shard_strategy['tp_config']
-                    index = tp_config['index']
-                    k = tp_config['k']
-                    self.self_attention.register_tp(bit, caliber)
-                else:
-                    quantize_linear_module_with_bit(self.self_attention, bit, caliber=caliber) if use_calib else \
-                        quantize_linear_module_with_bit(self.self_attention, bit)
+                    # check if the tp_config is inside the shard_strategy
+                    if 'tp_config' in shard_strategy:
+                        # quantize with tp sharding
+                        comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
+                        tp_config = shard_strategy['tp_config']
+                        index = tp_config['index']
+                        k = tp_config['k']
+                        self.self_attention.register_tp(bit, caliber)
+                    else:
+                        quantize_linear_module_with_bit(self.self_attention, bit, caliber=caliber) if use_calib else \
+                            quantize_linear_module_with_bit(self.self_attention, bit)
                 
             elif partition == 1:
                 bit = bits[idx]
@@ -522,33 +815,40 @@ class BloomBlockSharded(nn.Module):
                             fake_calib_data = caliber.named_fake_calib_data[k]
                             unique_id = caliber.man_set_unique_id(self.mlp.dense_h_to_4h)
                             caliber.man_set_module_calib_data(self.mlp.dense_h_to_4h, fake_calib_data)
-                        elif 'h_to_4h' in k:
+                        elif '4h_to_h' in k:
                             fake_calib_data = caliber.named_fake_calib_data[k]
                             unique_id = caliber.man_set_unique_id(self.mlp.dense_4h_to_h)
                             caliber.man_set_module_calib_data(self.mlp.dense_4h_to_h, fake_calib_data)
 
                 # quantize
                 if bit == "8:tc":
-                    # remove the 8:tc for the moment, since it is not availble in small batchsize
-                    print("use 8:tc-li instead" )
-                    bit = "8:tc-li"
-                if bit == "8:tc-li":
-                    bit = 8                    
-                    use_calib = True
+                    assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.mlp.dense_h_to_4h) is not None, \
+                        "Tensorcore is not available on this GPU, or the calibration data is not available"
+                    fc1_input_scale, fc1_output_scale = caliber.get_module_calib_data(self.mlp.dense_h_to_4h)
+                    fc2_input_scale, fc2_output_scale = caliber.get_module_calib_data(self.mlp.dense_4h_to_h)
+                    self.post_attention_layernorm = LayerNormQ.from_float(self.post_attention_layernorm, fc1_input_scale)
+                    self.mlp.dense_h_to_4h = W8A8B8O8LinearReLU.from_float(
+                    self.mlp.dense_h_to_4h, fc1_input_scale, fc2_input_scale)
+                    self.mlp.dense_4h_to_h = W8A8BFP32OFP32Linear.from_float(
+                    self.mlp.dense_4h_to_h, fc2_input_scale) #didn't change
                 else:
-                    use_calib = False
+                    if bit == "8:tc-li":
+                        bit = 8                    
+                        use_calib = True
+                    else:
+                        use_calib = False
 
-                # check if the tp_config is inside the shard_strategy
-                if 'tp_config' in shard_strategy:
-                    # quantize with tp sharding
-                    comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
-                    tp_config = shard_strategy['tp_config']
-                    index = tp_config['index']
-                    k = tp_config['k']
-                    self.mlp.register_tp(bit, caliber)
-                else:
-                    quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
-                        quantize_linear_module_with_bit(self.mlp, bit)
+                    # check if the tp_config is inside the shard_strategy
+                    if 'tp_config' in shard_strategy:
+                        # quantize with tp sharding
+                        comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
+                        tp_config = shard_strategy['tp_config']
+                        index = tp_config['index']
+                        k = tp_config['k']
+                        self.mlp.register_tp(bit, caliber)
+                    else:
+                        quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
+                            quantize_linear_module_with_bit(self.mlp, bit)
 
     @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, alibi=None, request_id=1):
@@ -590,7 +890,7 @@ class BloomBlockSharded(nn.Module):
 
         # MLP.
         output = self.mlp(layernorm_output, residual)
-
+        output = output.half()
         return (output, )  
 
     @torch.no_grad()

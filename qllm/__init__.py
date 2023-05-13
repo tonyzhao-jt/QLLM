@@ -11,3 +11,4 @@ from .utils import get_available_bits, get_available_bits_offline
 
 import os 
 os.environ['SET_DECODERS_META'] = "0" # whether to set the decoders' parameters to meta
+os.environ['PERF_MODE'] = "0" # reinitialize the weight

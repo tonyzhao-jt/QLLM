@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 import copy
 
+import os 
 import qllm
 import qllm.utils as qllm_utils
 import qllm.tp as tp 
@@ -36,7 +37,7 @@ import qllm.tp.utils as qllm_tp_utils
 import qllm.nn as qllm_nn
 import lptorch
 from lptorch import quantize_linear_module_with_bit, quantize_one_linear_module, ForwardTokenizer, AdaQTPConfig
-from lptorch.utils import is_tensorcore_int8_available, get_capability
+from lptorch.utils import is_tensorcore_int8_available, get_capability, init_weight_bias_with_rand
 
 from torch.nn.functional import pad
 
@@ -83,6 +84,16 @@ class Int8OPTAttention(nn.Module):
 
         self.fwd_tokenizer = ForwardTokenizer(16, 8)
 
+        self.enable_tp = False
+        self.tp_comm_group = None
+
+        # profile usage
+        self.profile = False
+
+        # kv related
+        self.kv_cache = {}
+        self.kv_status = {}
+
     @staticmethod
     @torch.no_grad()
     def from_float(module: OPTAttention,
@@ -90,12 +101,21 @@ class Int8OPTAttention(nn.Module):
                    q_output_scale: float,
                    k_output_scale: float,
                    v_output_scale: float,
-                   out_input_scale: float):
+                   out_output_scale: float # uniform the weight scale
+                                                 # reason is if the scale is not correctly provided,
+                                                 # its easy to encouter nan in practice
+                                                 # so we just init the weight
+                   ):
         int8_module = Int8OPTAttention(module.embed_dim, module.num_heads)
         # Fuse the scaling into the q_proj output scale
         q_output_scale = q_output_scale * module.scaling
         module.q_proj.weight *= module.scaling
         module.q_proj.bias *= module.scaling
+        perf_mode = os.environ['PERF_MODE'] == "1"
+        if perf_mode:
+            logger.info("perf mode is enabled")
+            input_scale = q_output_scale = k_output_scale = v_output_scale = out_output_scale = 1.0
+
         int8_module.q_proj = W8A8B8O8Linear.from_float(
             module.q_proj, input_scale, q_output_scale)
         int8_module.k_proj = W8A8B8O8Linear.from_float(
@@ -103,14 +123,78 @@ class Int8OPTAttention(nn.Module):
         int8_module.v_proj = W8A8B8O8Linear.from_float(
             module.v_proj, input_scale, v_output_scale)
         int8_module.out_proj = W8A8BFP32OFP32Linear.from_float(
-            module.out_proj, out_input_scale)
+            module.out_proj, out_output_scale)
         int8_module.qk_bmm = BMM_S8T_S8N_F32T.from_scale(
             q_output_scale, k_output_scale)
-
         # alpha = s_prob * s_v / s_out, where s_prob = 1 / 127
         int8_module.pv_bmm = BMM_S8T_S8N_S8T.from_scale(
-            1.0 / 127, v_output_scale, out_input_scale)
+            1.0 / 127, v_output_scale, out_output_scale)
+
+        if perf_mode:
+            # randomly init all weight involved
+            init_weight_bias_with_rand(int8_module.q_proj)
+            init_weight_bias_with_rand(int8_module.k_proj)
+            init_weight_bias_with_rand(int8_module.v_proj)
+            init_weight_bias_with_rand(int8_module.out_proj)
+
+        int8_module.q_output_scale = q_output_scale
+        int8_module.k_output_scale = k_output_scale
+        int8_module.v_output_scale = v_output_scale
+        int8_module.out_output_scale = out_output_scale
         return int8_module
+
+    @torch.no_grad()
+    def update_kv_cache(self, key_value_pair, request_id):
+        if len(self.kv_cache) == 0:
+            return 
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
+        # copy the key value pair to the cache
+        # self.kv_cache[layer_idx][request_id] = key_value_pair
+        prev_token_length = self.kv_status[request_id][0]
+        prompt_length = self.kv_status[request_id][1]
+        cur_token_length = prev_token_length + prompt_length - 1
+        self.kv_cache[request_id][:, :, cur_token_length, :, 0].copy_(key_value_pair[0][:, :, cur_token_length, :])
+        self.kv_cache[request_id][:, :, cur_token_length, :, 1].copy_(key_value_pair[1][:, :, cur_token_length, :])
+        # update token length
+        if not self.profile:
+            self.kv_status[request_id][0] += 1
+
+    @torch.no_grad()
+    def get_kv_cache(self, request_id):
+        if len(self.kv_cache) == 0:
+            return None # not initialized
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
+        # based on the prompt_length + previous token length to fetch kv
+        prev_token_length = self.kv_status[request_id][0]
+        prompt_length = self.kv_status[request_id][1]
+        kv_output_length = prompt_length + prev_token_length - 1
+
+        if prev_token_length == 0:
+            return None
+        # for bloom
+            # concatenate along seq_length dimension:
+            #  - key: [batch_size * self.num_heads, head_dim, kv_length]
+            #  - value: [batch_size * self.num_heads, kv_length, head_dim]
+        kv = (
+            self.kv_cache[request_id][:, :, :kv_output_length, :, 0],
+            self.kv_cache[request_id][:, :, :kv_output_length, :, 1]
+        )
+        return kv
+    
+    @torch.no_grad()
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16, init_with_xavier=False):
+        max_seq_len = prompt_length + token_to_generate
+        kv_shape_2 = (b, self.num_heads, max_seq_len, self.head_dim, 2)
+        # params = list(self.q_proj.parameters())
+        device =self.q_proj.weight.device
+        if isinstance(request_id, torch.Tensor):
+            request_id = request_id.item()
+        self.kv_cache[request_id] = torch.empty(kv_shape_2, dtype=torch_dtype, device=device)
+        if init_with_xavier:
+            nn.init.xavier_uniform_(self.kv_cache[request_id])
+        self.kv_status[request_id] = [0, prompt_length]
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -120,11 +204,10 @@ class Int8OPTAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         key_value_states: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         layer_head_mask: Optional[torch.Tensor] = None,
-        output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        request_id: int = 1,
+    )  -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """Input shape: Batch x Time x Channel"""
         # if key_value_states are provided this layer is used as a cross-attention layer
         # for the decoder
@@ -135,11 +218,7 @@ class Int8OPTAttention(nn.Module):
         # get query proj
         if hidden_states.dtype != torch.int8:
             hidden_states = self.fwd_tokenizer(hidden_states)
-        # print(hidden_states, hidden_states.shape, hidden_states.dtype)
-        # print(self.q_proj)
-        # print(self.q_proj.weight, self.q_proj.weight.shape, self.q_proj.weight.dtype)
-        # print(self.q_proj.bias, self.q_proj.bias.shape, self.q_proj.bias.dtype)
-        # print(self.q_proj.a, self.q_proj.b)
+        past_key_value = self.get_kv_cache(request_id)
         query_states = self.q_proj(hidden_states)
         # get key, value proj
         if is_cross_attention and past_key_value is not None:
@@ -162,6 +241,7 @@ class Int8OPTAttention(nn.Module):
             value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
 
         past_key_value = (key_states, value_states)
+        self.update_kv_cache(past_key_value, request_id)
 
         proj_shape = (bsz * self.num_heads, -1, self.head_dim)
         query_states = self._shape(
@@ -170,27 +250,18 @@ class Int8OPTAttention(nn.Module):
         value_states = value_states.view(*proj_shape)
 
         src_len = key_states.size(1)
-        # for int8, N(src_length) need to be multiple of 16, padding here
-        # pad_len = (16 - src_len % 16) % 16
-        # padding = torch.zeros(key_states.size(0), pad_len, key_states.size(2), dtype=key_states.dtype, device=key_states.device)
-        # key_states = torch.cat([key_states, padding], dim=1)
 
-        # value_length = value_states.size(1)
-        # value_pad_length = (16 - value_states.size(1) % 16) % 16 
-        # padding_v = torch.zeros(value_states.size(0), value_pad_length, value_states.size(2), dtype=key_states.dtype, device=key_states.device)
-        # value_states = torch.cat([value_states, padding_v], dim=1)
-        # src_len = src_len + pad_len
-        # print(query_states.shape, key_states.shape)
-        # print(query_states.dtype, key_states.dtype)
-        # import pdb; pdb.set_trace()
-        # the bmm can only done in fp16. requires strict alginment and padding
-        # attn_weights = self.qk_bmm(query_states, key_states)
+        # fp16 BMM. 
         query_states = query_states.half()
         key_states = key_states.half()
-        attn_weights = torch.bmm(query_states, key_states.transpose(1,2)).contiguous()
-        # if src_len % 16:
-        #     attn_weights = torch.bmm(query_states.half(), key_states.transpose(1,2).half())
-        # else:
+        attn_weights = torch.bmm(query_states, key_states.transpose(1,2)).contiguous() 
+        # try:
+        #     if torch.any(torch.isnan(attn_weights)):
+        #         print("nan in attn_weights")
+        #         import pdb; pdb.set_trace()
+        # except:
+        #     pass
+        # int8 bmm
         # attn_weights = self.qk_bmm(query_states, key_states)
 
         if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
@@ -228,30 +299,21 @@ class Int8OPTAttention(nn.Module):
             attn_probs = attn_probs.view(
                 bsz * self.num_heads, tgt_len, src_len)
 
-        if output_attentions:
-            # this operation is a bit awkward, but it's required to
-            # make sure that attn_weights keeps its gradient.
-            # In order to do so, attn_weights have to be reshaped
-            # twice and have to be reused in the following
-            attn_probs_reshaped = attn_probs.view(
-                bsz, self.num_heads, tgt_len, src_len)
-            attn_probs = attn_probs_reshaped.view(
-                bsz * self.num_heads, tgt_len, src_len)
-        else:
-            attn_probs_reshaped = None
-
-        # (A_row V_row)_row = (A_row V_col ^T)_row
-        value_states = value_states.half().contiguous()
-        attn_probs.mul_(127).round_()
+        # fp16 bmm
+        scale = self.v_output_scale *  127 / self.out_output_scale
+        value_states = value_states.half() * scale
         attn_output = torch.bmm(attn_probs, value_states) # here the value is in fp16
-        # # round the value into the int8 range
-        attn_output.clamp_(-127, 127).round_()
-        attn_output = attn_output.to(torch.int8)
+        attn_output = attn_output.to(torch.int8).contiguous()
 
-        # if src_len % 16:
-        #     attn_output = torch.bmm(attn_probs.half(), value_states.half())
-        #     attn_output = attn_output.to(torch.int8)
-        # else:
+        # try:
+        #     if torch.any(torch.isnan(attn_output)):
+        #         print("nan in attn_weights")
+        #         import pdb; pdb.set_trace()
+        #     print(attn_output)
+        # except:
+        #     pass
+
+        # int8 bmm
         # attn_probs.mul_(127).round_()
         # attn_probs = attn_probs.to(torch.int8)
         # value_states = value_states.transpose(1, 2).contiguous()
@@ -272,7 +334,7 @@ class Int8OPTAttention(nn.Module):
         attn_output = attn_output.reshape(
             bsz, tgt_len, self.embed_dim).contiguous()
         attn_output = self.out_proj(attn_output)
-        return attn_output, attn_probs_reshaped, past_key_value
+        return attn_output
 
 class OPTAttentionSeq(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -346,7 +408,7 @@ class OPTAttentionSeq(nn.Module):
 
     @torch.no_grad()
     def update_kv_cache(self, key_value_pair, request_id):
-        if len(self.kv_cache) == 0 or self.profile:
+        if len(self.kv_cache) == 0:
             return 
         if isinstance(request_id, torch.Tensor):
             request_id = request_id.item()
@@ -354,10 +416,12 @@ class OPTAttentionSeq(nn.Module):
         # self.kv_cache[layer_idx][request_id] = key_value_pair
         prev_token_length = self.kv_status[request_id][0]
         prompt_length = self.kv_status[request_id][1]
-        self.kv_cache[request_id][:, :, prev_token_length:prev_token_length + prompt_length, :, 0].copy_(key_value_pair[0][:, :, prev_token_length:prev_token_length + prompt_length, :])
-        self.kv_cache[request_id][:, :, prev_token_length:prev_token_length + prompt_length, :, 1].copy_(key_value_pair[1][:, :, prev_token_length:prev_token_length + prompt_length, :])
+        cur_token_length = prev_token_length + prompt_length - 1
+        self.kv_cache[request_id][:, :, cur_token_length, :, 0].copy_(key_value_pair[0][:, :, cur_token_length, :])
+        self.kv_cache[request_id][:, :, cur_token_length, :, 1].copy_(key_value_pair[1][:, :, cur_token_length, :])
         # update token length
-        self.kv_status[request_id][0] += 1
+        if not self.profile:
+            self.kv_status[request_id][0] += 1
 
     @torch.no_grad()
     def get_kv_cache(self, request_id):
@@ -383,7 +447,7 @@ class OPTAttentionSeq(nn.Module):
         return kv
     
     @torch.no_grad()
-    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16):
+    def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16, init_with_xavier=False):
         max_seq_len = prompt_length + token_to_generate
         kv_shape_2 = (b, self.num_heads, max_seq_len, self.head_dim, 2)
         params = list(self.q_proj.parameters())
@@ -391,6 +455,8 @@ class OPTAttentionSeq(nn.Module):
         if isinstance(request_id, torch.Tensor):
             request_id = request_id.item()
         self.kv_cache[request_id] = torch.empty(kv_shape_2, dtype=torch_dtype, device=device)
+        if init_with_xavier:
+            nn.init.xavier_uniform_(self.kv_cache[request_id])
         self.kv_status[request_id] = [0, prompt_length]
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -707,42 +773,37 @@ class OPTDecoderLayerSharded(nn.Module):
                                 unique_id = caliber.man_set_unique_id(self.self_attn.out_proj)
                                 caliber.man_set_module_calib_data(self.self_attn.out_proj, fake_calib_data)
 
-                # if bit == "8:tc": # tensorcore int8
-                #     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attn.q_proj) is not None, \
-                #         "Tensorcore is not available on this GPU, or the calibration data is not available"
-                #     attn_input_scale, q_output_scale = caliber.get_module_calib_data(self.self_attn.q_proj)
-                #     _, k_output_scale = caliber.get_module_calib_data(self.self_attn.k_proj)
-                #     _, v_output_scale = caliber.get_module_calib_data(self.self_attn.v_proj)
-                #     _, out_input_scale = caliber.get_module_calib_data(self.self_attn.out_proj)
-                #     self.self_attn = Int8OPTAttention.from_float(
-                #         self.self_attn, attn_input_scale, q_output_scale, k_output_scale, v_output_scale, out_input_scale)
+                if bit == "8:tc": # tensorcore int8
+                    assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attn.q_proj) is not None, \
+                        "Tensorcore is not available on this GPU, or the calibration data is not available"
+                    attn_input_scale, q_output_scale = caliber.get_module_calib_data(self.self_attn.q_proj)
+                    _, k_output_scale = caliber.get_module_calib_data(self.self_attn.k_proj)
+                    _, v_output_scale = caliber.get_module_calib_data(self.self_attn.v_proj)
+                    _, out_output_scale = caliber.get_module_calib_data(self.self_attn.out_proj)
+                    self.self_attn = Int8OPTAttention.from_float(
+                        self.self_attn, attn_input_scale, q_output_scale, k_output_scale, v_output_scale, out_output_scale)
                     
-                #     # if self.do_layer_norm_before:
-                #     #     self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
-                #     self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
-                    # else remain fp16 layernorm
-                # TODO: support 8:tc in tp, 8:tc performs weirdly
-                if bit == "8:tc":
-                    # remove the 8:tc for the moment, since it is not availble in small batchsize
-                    print("use 8:tc-li instead" )
-                    bit = "8:tc-li"
-                if bit == "8:tc-li":
-                    bit = 8
-                    use_calib = True
+                    # if self.do_layer_norm_before:
+                    #     self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
+                    self.self_attn_layer_norm = LayerNormQ.from_float(self.self_attn_layer_norm, attn_input_scale)
                 else:
-                    use_calib = False
+                    if bit == "8:tc-li":
+                        bit = 8
+                        use_calib = True
+                    else:
+                        use_calib = False
 
-                # check if the tp_config is inside the shard_strategy
-                if 'tp_config' in shard_strategy:
-                    # quantize with tp sharding
-                    comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
-                    tp_config = shard_strategy['tp_config']
-                    index = tp_config['index']
-                    k = tp_config['k']
-                    self.self_attn.register_tp(bit, caliber)
-                else:
-                    quantize_linear_module_with_bit(self.self_attn, bit, caliber=caliber) if use_calib else \
-                        quantize_linear_module_with_bit(self.self_attn, bit)
+                    # check if the tp_config is inside the shard_strategy
+                    if 'tp_config' in shard_strategy:
+                        # quantize with tp sharding
+                        comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
+                        tp_config = shard_strategy['tp_config']
+                        index = tp_config['index']
+                        k = tp_config['k']
+                        self.self_attn.register_tp(bit, caliber)
+                    else:
+                        quantize_linear_module_with_bit(self.self_attn, bit, caliber=caliber) if use_calib else \
+                            quantize_linear_module_with_bit(self.self_attn, bit)
                 
             elif partition == 1:
                 bit = bits[idx]
@@ -770,38 +831,34 @@ class OPTDecoderLayerSharded(nn.Module):
                             unique_id = caliber.man_set_unique_id(self.mlp.fc2)
                             caliber.man_set_module_calib_data(self.mlp.fc2, fake_calib_data)
 
-                # if bit == "8:tc":
-                #     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.mlp.fc1) is not None, \
-                #         "Tensorcore is not available on this GPU, or the calibration data is not available"
-                #     fc1_input_scale, fc1_output_scale = caliber.get_module_calib_data(self.mlp.fc1)
-                #     fc2_input_scale, fc2_output_scale = caliber.get_module_calib_data(self.mlp.fc2)
-                #     self.final_layer_norm = LayerNormQ.from_float(self.final_layer_norm, fc1_input_scale)
-                #     self.mlp.fc1 = W8A8B8O8LinearReLU.from_float(
-                #     self.mlp.fc1, fc1_input_scale, fc2_input_scale)
-                #     self.mlp.fc2 = W8A8BFP32OFP32Linear.from_float(
-                #     self.mlp.fc2, fc2_input_scale)
-                # TODO: support tc:8 in fut
                 if bit == "8:tc":
-                    # remove the 8:tc for the moment, since it is not availble in small batchsize
-                    print("use 8:tc-li instead" )
-                    bit = "8:tc-li"
-                if bit == "8:tc-li":
-                    bit = 8                    
-                    use_calib = True
+                    assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.mlp.fc1) is not None, \
+                        "Tensorcore is not available on this GPU, or the calibration data is not available"
+                    fc1_input_scale, fc1_output_scale = caliber.get_module_calib_data(self.mlp.fc1)
+                    fc2_input_scale, fc2_output_scale = caliber.get_module_calib_data(self.mlp.fc2)
+                    self.mlp.final_layer_norm = LayerNormQ.from_float(self.mlp.final_layer_norm, fc1_input_scale)
+                    self.mlp.fc1 = W8A8B8O8LinearReLU.from_float(
+                    self.mlp.fc1, fc1_input_scale, fc2_input_scale)
+                    self.mlp.fc2 = W8A8BFP32OFP32Linear.from_float(
+                    self.mlp.fc2, fc2_input_scale)
                 else:
-                    use_calib = False
+                    if bit == "8:tc-li":
+                        bit = 8                    
+                        use_calib = True
+                    else:
+                        use_calib = False
 
-                # check if the tp_config is inside the shard_strategy
-                if 'tp_config' in shard_strategy:
-                    # quantize with tp sharding
-                    comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
-                    tp_config = shard_strategy['tp_config']
-                    index = tp_config['index']
-                    k = tp_config['k']
-                    self.mlp.register_tp(bit, caliber)
-                else:
-                    quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
-                        quantize_linear_module_with_bit(self.mlp, bit)
+                    # check if the tp_config is inside the shard_strategy
+                    if 'tp_config' in shard_strategy:
+                        # quantize with tp sharding
+                        comm_group = qllm._globals.__TENSOR__MODEL_PARALLEL__GROUP__
+                        tp_config = shard_strategy['tp_config']
+                        index = tp_config['index']
+                        k = tp_config['k']
+                        self.mlp.register_tp(bit, caliber)
+                    else:
+                        quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
+                            quantize_linear_module_with_bit(self.mlp, bit)
                 
     @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, request_id=1):
