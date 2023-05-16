@@ -98,11 +98,21 @@ AVAILABLE_MAP = {
     "facebook/opt-66b": "https://huggingface.co/facebook/opt-13b/blob/main/config.json",
 }
 
-def load_pretained_model_from_net(repo_name, dtype=torch.float16):
+def load_pretained_model_from_net(repo_name, dtype=torch.float16, cache_dir=None):
     assert repo_name in AVAILABLE_MAP, f"model {repo_name} not available in repo"
-    model = OPTForCausalLM.from_pretrained(repo_name, torch_dtype=dtype)
+    if cache_dir is not None:
+        model = OPTForCausalLM.from_pretrained(repo_name, torch_dtype=dtype, cache_dir=cache_dir)
+    else:
+        model = OPTForCausalLM.from_pretrained(repo_name, torch_dtype=dtype)
     tokenizer = AutoTokenizer.from_pretrained(repo_name)
     return model, tokenizer
+
+def load_pretrained_from_size(model_size, dtype=torch.float16, cache_dir=None):
+    AVAILABLE_MAP_keys = list(AVAILABLE_MAP.keys())
+    for key in AVAILABLE_MAP_keys:
+        if str(model_size) in key:
+            return load_pretained_model_from_net(key, dtype=dtype, cache_dir=cache_dir)
+    raise Exception(f"model size {model_size} not available")
 
 def get_available_pretained_models():
     return AVAILABLE_MAP.keys()

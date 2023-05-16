@@ -5,6 +5,7 @@ from . import utils
 from . import _globals
 from . import tp
 from . import nn
+from . import fast_download
 from .custom_generate import SequentialGenerate
 from .utils import get_available_bits, get_available_bits_offline
 
