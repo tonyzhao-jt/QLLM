@@ -153,6 +153,16 @@ class ModelMemEstimator:
                        self.calculate_temp_tensor_size_next_i(unit)[0], \
                         self.calculate_temp_embedding_tensor_size(unit)[0])
         return max_temp, f'{max_temp} {unit}'
+    
+    def calculate_temp_tensor_size_with_bz(self, bz_prefill, bz_decode, unit='b'):
+        ratio_decode = bz_decode / self.b
+        ratio_prefill = bz_prefill / self.b
+        # calculate the temp tensor size with different batch size
+        # return in bytes
+        max_temp = max(self.calculate_temp_tensor_size_prefill(unit)[0] * ratio_prefill, \
+                       self.calculate_temp_tensor_size_next_i(unit)[0] * ratio_decode, \
+                        self.calculate_temp_embedding_tensor_size(unit)[0] * ratio_prefill)
+        return max_temp, f'{max_temp} {unit}'
 
     def calculate_model_occupation_of_partition(self, partition, unit='b'):
         # partition should be with format

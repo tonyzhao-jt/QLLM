@@ -196,7 +196,7 @@ class BloomAttention(nn.Module):
         self.broadcast = broadcast_group
 
     @torch.no_grad()
-    def update_kv_cache(self, key_value_pair, request_id):
+    def update_kv_cache(self, key_value_pair, request_id, batch_index=None):
         if len(self.kv_cache) == 0:
             return 
         if isinstance(request_id, torch.Tensor):
@@ -206,14 +206,23 @@ class BloomAttention(nn.Module):
         prev_token_length = self.kv_status[request_id][0]
         prompt_length = self.kv_status[request_id][1]
         cur_token_length = prev_token_length + prompt_length - 1
-        self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
-        self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
-        # update token length
-        if not self.profile:
-            self.kv_status[request_id][0] += 1
+
+        if batch_index is not None:
+            start_batch_index = batch_index[0].item() * self.num_heads
+            end_batch_index = batch_index[1].item() * self.num_heads
+            self.kv_cache[request_id][0][start_batch_index:end_batch_index, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+            self.kv_cache[request_id][1][start_batch_index:end_batch_index, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+            if end_batch_index == self.kv_cache[request_id][0].shape[0]:
+                self.kv_status[request_id][0] += 1 # finish prefill
+        else:
+            self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+            self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+            # update token length
+            if not self.profile:
+                self.kv_status[request_id][0] += 1
 
     @torch.no_grad()
-    def get_kv_cache(self, request_id):
+    def get_kv_cache(self, request_id, batch_index=None):
         if len(self.kv_cache) == 0:
             return None # not initialized
         if isinstance(request_id, torch.Tensor):
@@ -223,7 +232,7 @@ class BloomAttention(nn.Module):
         prompt_length = self.kv_status[request_id][1]
         kv_output_length = prompt_length + prev_token_length - 1
 
-        if prev_token_length == 0:
+        if prev_token_length == 0 or batch_index is not None:
             return None
         # for bloom
             # concatenate along seq_length dimension:
@@ -304,6 +313,7 @@ class BloomAttention(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
         request_id: int = 1,
+        batch_index: Optional[torch.Tensor] = None,
     ):
         if self.enable_tp and self.broadcast:
             group = qllm_tp_utils.get_tp_group()
@@ -319,7 +329,7 @@ class BloomAttention(nn.Module):
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
-        layer_past = self.get_kv_cache(request_id) 
+        layer_past = self.get_kv_cache(request_id, batch_index=batch_index) 
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
@@ -329,7 +339,7 @@ class BloomAttention(nn.Module):
             value_layer = torch.cat((past_value, value_layer), dim=1)
             
         # update kv cache
-        self.update_kv_cache((key_layer, value_layer), request_id)
+        self.update_kv_cache((key_layer, value_layer), request_id, batch_index=batch_index)
 
         _, _, kv_length = key_layer.shape
 
@@ -470,7 +480,7 @@ class Int8BLOOMAttention(nn.Module):
         return int8_module
 
     @torch.no_grad()
-    def update_kv_cache(self, key_value_pair, request_id):
+    def update_kv_cache(self, key_value_pair, request_id, batch_index=None):
         if len(self.kv_cache) == 0:
             return 
         if isinstance(request_id, torch.Tensor):
@@ -480,14 +490,22 @@ class Int8BLOOMAttention(nn.Module):
         prev_token_length = self.kv_status[request_id][0]
         prompt_length = self.kv_status[request_id][1]
         cur_token_length = prev_token_length + prompt_length - 1
-        self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
-        self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
-        # update token length
-        if not self.profile:
-            self.kv_status[request_id][0] += 1
+        if batch_index is not None:
+            start_batch_index = batch_index[0].item()
+            end_batch_index = batch_index[1].item()
+            self.kv_cache[request_id][0][start_batch_index:end_batch_index, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+            self.kv_cache[request_id][1][start_batch_index:end_batch_index, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+            if end_batch_index == self.kv_cache[request_id].shape[0]:
+                self.kv_status[request_id][0] += 1 # finish prefill
+        else:
+            self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+            self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+            # update token length
+            if not self.profile:
+                self.kv_status[request_id][0] += 1
 
     @torch.no_grad()
-    def get_kv_cache(self, request_id):
+    def get_kv_cache(self, request_id, batch_index=None):
         if len(self.kv_cache) == 0:
             return None # not initialized
         if isinstance(request_id, torch.Tensor):
@@ -497,7 +515,7 @@ class Int8BLOOMAttention(nn.Module):
         prompt_length = self.kv_status[request_id][1]
         kv_output_length = prompt_length + prev_token_length - 1
 
-        if prev_token_length == 0:
+        if prev_token_length == 0 or batch_index is not None:
             return None
         # for bloom
             # concatenate along seq_length dimension:
@@ -516,8 +534,8 @@ class Int8BLOOMAttention(nn.Module):
         max_seq_len = prompt_length + token_to_generate
         k_shape = (b * self.num_heads, self.head_dim, max_seq_len)
         v_shape = (b * self.num_heads, max_seq_len, self.head_dim)
-        # params = list(self.query_key_value.parameters())
-        device = self.query_key_value.weight.device
+        params = list(self.query_key_value.parameters())
+        device = params[0].device
         self.kv_cache[request_id] = (
             torch.empty(k_shape, dtype=torch_dtype, device=device),
             torch.empty(v_shape, dtype=torch_dtype, device=device)
@@ -583,6 +601,7 @@ class Int8BLOOMAttention(nn.Module):
         use_cache: bool = False,
         output_attentions: bool = False,
         request_id: int = 1,
+        batch_index: Optional[torch.Tensor] = None,
     )  -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
         if hidden_states.dtype != torch.int8:
@@ -598,7 +617,7 @@ class Int8BLOOMAttention(nn.Module):
         query_layer = query_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
         key_layer = key_layer.permute(0, 2, 3, 1).reshape(batch_size * self.num_heads, self.head_dim, q_length)
         value_layer = value_layer.transpose(1, 2).reshape(batch_size * self.num_heads, q_length, self.head_dim)
-        layer_past = self.get_kv_cache(request_id) 
+        layer_past = self.get_kv_cache(request_id, batch_index=batch_index) 
         if layer_past is not None:
             past_key, past_value = layer_past
             # concatenate along seq_length dimension:
@@ -608,7 +627,7 @@ class Int8BLOOMAttention(nn.Module):
             value_layer = torch.cat((past_value, value_layer), dim=1)
 
         past_key_value = (key_layer, value_layer)
-        self.update_kv_cache(past_key_value, request_id)
+        self.update_kv_cache(past_key_value, request_id, batch_index=batch_index)
 
         _, _, kv_length = key_layer.shape
 
@@ -851,7 +870,7 @@ class BloomBlockSharded(nn.Module):
                             quantize_linear_module_with_bit(self.mlp, bit)
 
     @torch.no_grad()
-    def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, alibi=None, request_id=1):
+    def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, alibi=None, request_id=1, batch_index=None):
         # Layer norm at the beginning of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
 
@@ -869,7 +888,8 @@ class BloomBlockSharded(nn.Module):
             alibi=alibi,
             head_mask=layer_head_mask,
             output_attentions=False, # didn't ouput attention
-            request_id=request_id
+            request_id=request_id,
+            batch_index=batch_index,
         )
 
         attention_output = attn_outputs[0]
@@ -902,6 +922,7 @@ class BloomBlockSharded(nn.Module):
         output_attentions: Optional[bool] = False,
         alibi: Optional[torch.Tensor] = None,
         request_id: int = 1,
+        batch_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
         """
@@ -921,7 +942,7 @@ class BloomBlockSharded(nn.Module):
         """
         if 0 in self.partitions:
             hidden_states = self.SELFATTEN_PART(hidden_states, attention_mask, head_mask, \
-                                                 alibi=alibi, request_id=request_id)
+                                                 alibi=alibi, request_id=request_id, batch_index=batch_index)
             # hidden states here are tuple
             if 1 in self.partitions:
                 hidden_states = hidden_states[0]
@@ -1157,6 +1178,7 @@ class BloomModelSeq(BloomModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         request_id: Optional[int] = 1,
+        batch_index: Optional[torch.Tensor] = None,
         **deprecated_arguments,
     ) -> Union[Tuple[torch.Tensor, ...], BaseModelOutputWithPastAndCrossAttentions]:
         mask_and_cache = (attention_mask, head_mask, alibi, use_cache) 
@@ -1171,18 +1193,19 @@ class BloomModelSeq(BloomModel):
                 output_attentions=output_attentions,
                 alibi=alibi,
                 request_id=request_id,
+                batch_index=batch_index,
             )
 
             if block.is_only_self_attention():
                 hidden_states = (outputs[0], ) # 
-                return hidden_states + mask_and_cache + (request_id, ) 
+                return hidden_states + mask_and_cache + (request_id, batch_index) 
 
             hidden_states = outputs[0]
 
         # Add last hidden state
         # hidden_states = self.ln_f(hidden_states)
 
-        return (hidden_states, ) + mask_and_cache + (request_id, )
+        return (hidden_states, ) + mask_and_cache + (request_id, batch_index)
 
 class BloomForCausalLMSeq(BloomForCausalLM):
     def __init__(self, config: BloomConfig):
@@ -1198,7 +1221,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         Same for all LLMs
     '''
     @torch.no_grad()
-    def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1):
+    def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1, batch_index=None):
         with torch.no_grad():
             batch_size, seq_length = new_input_ids.shape
             embed_tokens = self.transformer.word_embeddings
@@ -1221,14 +1244,14 @@ class BloomForCausalLMSeq(BloomForCausalLM):
                 past_key_values_length=past_key_values_length,
             )
             mask_and_cache = (causal_mask, head_mask, alibi, use_cache) 
-            request_token = (hidden_states,) + mask_and_cache + (request_id, )
+            request_token = (hidden_states,) + mask_and_cache + (request_id, batch_index)
             request_token = qllm_utils.object_to_tensor(request_token)
             return request_token
     
     @torch.no_grad()
     def preprocess(self, input_ids=None, attention_mask=None, head_mask=None, past_key_values=None, inputs_embeds=None,
                    use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, request_id=1, \
-                    past_key_values_length: int = 0, **kwargs):
+                    past_key_values_length: int = 0, batch_index=None, **kwargs):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1256,7 +1279,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         alibi = pre_result['alibi']
         use_cache = use_cache
         mask_and_cache = (attention_mask, head_mask, alibi, use_cache) 
-        pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, )
+        pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, batch_index, )
         pre_result = qllm_utils.object_to_tensor(pre_result)
         return pre_result
     
@@ -1315,9 +1338,11 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         def shard_launcher(prev_result, module_shard):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
-            attention_mask, head_mask, alibi, use_cache, request_id = prev_result[1:]
+            attention_mask, head_mask, alibi, use_cache, request_id, batch_index = prev_result[1:]
             p_head_mask = qllm_utils.return_none_if_nan(head_mask)
             p_attention_mask = qllm_utils.return_none_if_nan(attention_mask)
+            batch_index = qllm_utils.return_none_if_nan(batch_index)
+
             res = module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,
@@ -1327,6 +1352,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
                 use_cache=use_cache,
                 alibi=alibi,
                 request_id=request_id,
+                batch_index=batch_index,
             )
             return (res[0],) + prev_result[1:]
 

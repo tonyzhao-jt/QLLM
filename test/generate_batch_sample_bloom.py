@@ -65,43 +65,43 @@ if __name__ == '__main__':
             23: {'shard': [0,1], 'bits': [16, 16]},
         }
     }    
-    # perf with int
-    sharding_strategy = {
-        0: {
-        },
-        1: {
-            0: {'shard': [0, 1], 'bits': [16, 16]},
-            1: {'shard': [0, 1], 'bits': [16, 16]},
-            2: {'shard': [0, 1], 'bits': [16, 16]},
-            3: {'shard': [0, 1], 'bits': [16, 16]},
-            4: {'shard': [0, 1], 'bits': [16, 16]},
-            5: {'shard': [0, 1], 'bits': [16, 16]},
-            6: {'shard': [0, 1], 'bits': [16, 16]},
-            7: {'shard': [0, 1], 'bits': [16, 16]},
-            8: {'shard': [0], 'bits': [16]},
-        },
-        2: {
-            8: {'shard': [1], 'bits': [16]},
-            9: {'shard': [0,1], 'bits': [16, 16]},
-            10: {'shard': [0,1], 'bits': [16, 16]},
-            11: {'shard': [0,1], 'bits': [16, 16]},
-            # 350M
-            12: {'shard': [0,1], 'bits': [16, 16]},
-            13: {'shard': [0,1], 'bits': ['8:tc', 16]},
-            14: {'shard': [0,1], 'bits': [16, '8:tc']},
-        },
-        3:{
-            15: {'shard': [0,1], 'bits': [16, 16]},
-            16: {'shard': [0,1], 'bits': [16, 16]},
-            17: {'shard': [0,1], 'bits': [16, 16]},
-            18: {'shard': [0,1], 'bits': [16, 16]},
-            19: {'shard': [0,1], 'bits': [16, 16]},
-            20: {'shard': [0,1], 'bits': [16, 16]},
-            21: {'shard': [0,1], 'bits': [16, 16]},
-            22: {'shard': [0,1], 'bits': [16, 16]}, 
-            23: {'shard': [0,1], 'bits': [16, 16]},
-        }
-    }    
+    # # perf with int
+    # sharding_strategy = {
+    #     0: {
+    #     },
+    #     1: {
+    #         0: {'shard': [0, 1], 'bits': [16, 16]},
+    #         1: {'shard': [0, 1], 'bits': [16, 16]},
+    #         2: {'shard': [0, 1], 'bits': [16, 16]},
+    #         3: {'shard': [0, 1], 'bits': [16, 16]},
+    #         4: {'shard': [0, 1], 'bits': [16, 16]},
+    #         5: {'shard': [0, 1], 'bits': [16, 16]},
+    #         6: {'shard': [0, 1], 'bits': [16, 16]},
+    #         7: {'shard': [0, 1], 'bits': [16, 16]},
+    #         8: {'shard': [0], 'bits': [16]},
+    #     },
+    #     2: {
+    #         8: {'shard': [1], 'bits': [16]},
+    #         9: {'shard': [0,1], 'bits': [16, 16]},
+    #         10: {'shard': [0,1], 'bits': [16, 16]},
+    #         11: {'shard': [0,1], 'bits': [16, 16]},
+    #         # 350M
+    #         12: {'shard': [0,1], 'bits': [16, 16]},
+    #         13: {'shard': [0,1], 'bits': ['8:tc', 16]},
+    #         14: {'shard': [0,1], 'bits': [16, '8:tc']},
+    #     },
+    #     3:{
+    #         15: {'shard': [0,1], 'bits': [16, 16]},
+    #         16: {'shard': [0,1], 'bits': [16, 16]},
+    #         17: {'shard': [0,1], 'bits': [16, 16]},
+    #         18: {'shard': [0,1], 'bits': [16, 16]},
+    #         19: {'shard': [0,1], 'bits': [16, 16]},
+    #         20: {'shard': [0,1], 'bits': [16, 16]},
+    #         21: {'shard': [0,1], 'bits': [16, 16]},
+    #         22: {'shard': [0,1], 'bits': [16, 16]}, 
+    #         23: {'shard': [0,1], 'bits': [16, 16]},
+    #     }
+    # }    
     
     # Tp related.
     # logic is like that: first, based on the TP group allocation, we init the tp group, and return the k and index value for each rank

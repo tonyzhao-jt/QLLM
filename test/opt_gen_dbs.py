@@ -4,23 +4,19 @@ from qllm.utils import get_model_size_cuda, list_tensors_on_cuda
 from qllm.utils import (
     check_model_weights_dtype,
     to_device_recursive, to_device_recursive_except, 
-    to_dtype_recursive, to_dtype_recursive_except, to_dtype_except_linear_layer, to_half_for_modules,
-    get_iter_variable_size
+    create_ds_indexes
 )
 from qllm.models.OPT import OPTForCausalLMSeq
+from qllm.scheduler import DSScheduler
 import lptorch
 import torch
 import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
-from qllm.tp import utils as tp_utils
 if __name__ == '__main__':
     opt_125M, tokenizer = opt.load_pretained_model_from_net('facebook/opt-125m')
     # sample text
     max_length = 512
-    # sample text
-    batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog. ", "Just test performance. How about you. ", \
-                                                "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], \
-                                                padding='max_length', max_length=max_length, return_tensors="pt")
+
     
     weight_loaded_model = OPTForCausalLMSeq.from_pretrained("facebook/opt-125m", torch_dtype=torch.float16)
     sharding_strategy = {
@@ -48,42 +44,6 @@ if __name__ == '__main__':
     }
     print("decoder layernum", weight_loaded_model.get_decoder_layer_num())
     
-    # sharding_strategy = {
-    #     0: {
-    #     },
-    #     1: {
-    #         0: {'shard': [0, 1], 'bits': [16, 16]},
-    #         1: {'shard': [0, 1], 'bits': [16, 16]},
-    #         2: {'shard': [0, 1], 'bits': [16, 16]},
-    #         3: {'shard': [0, 1], 'bits': [16, 16]},
-    #         4: {'shard': [0, 1], 'bits': [16, 16]},
-    #         5: {'shard': [0, 1], 'bits': [16, 16]},
-    #         6: {'shard': [0, 1], 'bits': [16, 16]},
-    #         7: {'shard': [0, 1], 'bits': [16, 16]},
-    #         8: {'shard': [0], 'bits': [16]},
-    #     },
-    #     2: {
-    #         8: {'shard': [1], 'bits': [16]},
-    #         9: {'shard': [0,1], 'bits': [16, 16]},
-    #         10: {'shard': [0,1], 'bits': [16, 16]},
-    #         11: {'shard': [0,1], 'bits': [16, 16]},
-    #         # 350M
-    #         12: {'shard': [0,1], 'bits': [16, 16]},
-    #         13: {'shard': [0,1], 'bits': [16, 16]},
-    #         14: {'shard': [0,1], 'bits': [16, 16]},
-    #         15: {'shard': [0,1], 'bits': [16, 16]},
-    #         16: {'shard': [0,1], 'bits': [16, 16]},
-    #         17: {'shard': [0,1], 'bits': [16, 16]},
-    #         18: {'shard': [0,1], 'bits': [16, 16]},
-    #         19: {'shard': [0,1], 'bits': [16, 16]},
-    #         20: {'shard': [0,1], 'bits': [16, 16]},
-    #         21: {'shard': [0,1], 'bits': [16, 16]},
-    #         22: {'shard': [0,1], 'bits': [16, 16]}, 
-    #         23: {'shard': [0,1], 'bits': [16, 16]},
-    #     }
-    # }    
-    res = tp_utils.register_tp_group_and_update_strategy([], sharding_strategy)
-    
     # set calib results
     caliber = lptorch.inner_caliber
     caliber.set_model(weight_loaded_model)
@@ -105,11 +65,6 @@ if __name__ == '__main__':
     opt_125M = opt_125M.cuda()
 
     # init KV cache
-    num_tokens_to_generate = 100
-    bs, prompt_length = batched_ids['input_ids'].shape
-    # becareful to use this one
-    batched_ids = to_device_recursive(dict(batched_ids), device)
-
     # print model 1, 2, 3 size in MB
     print("Original Model Size:", get_model_size_cuda(opt_125M.model, 'MB'))
     # print model 1, 2, 3 size in MB
@@ -117,6 +72,27 @@ if __name__ == '__main__':
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
 
+
+    # create prefill bs 1 and decode bs 2
+    sample_text = ["Hi, where is my dog. ", "Hi, where is my dog. ", "Just test performance. How about you. ", "Just test performance. How about you. ", \
+                                                "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"]
+    
+    decoder_bss = [2, 3]
+    prefill_bs = 2
+    prompt_length = max_length
+    ds_scheduler = DSScheduler(prefill_bs, decoder_bss)
+    sample_text_dict = ds_scheduler.split_list_of_prompts(sample_text)
+    prefill_bs_indexes = ds_scheduler.create_ds_indexes()
+    for request_id, sample_text_list in sample_text_dict.items():
+        sample_text_dict[request_id] = to_device_recursive([dict(tokenizer.batch_encode_plus(text, padding='max_length', max_length=max_length, return_tensors="pt")) for text \
+                        in sample_text_list], device)
+
+    num_tokens_to_generate = 100
+    # sample reference
+    batched_ids = tokenizer.batch_encode_plus(sample_text, padding='max_length', max_length=max_length, return_tensors="pt")
+    batched_ids = dict(batched_ids)
+    batched_ids = to_device_recursive(batched_ids, device)
+    
     with torch.no_grad():
         res_2 = opt_125M(**batched_ids)
 
@@ -133,8 +109,12 @@ if __name__ == '__main__':
         # pre-process distribution
         next_tokens_scores = logits_processor(input_ids, next_token_logits)
         next_tokens = torch.argmax(next_tokens_scores, dim=-1)
-        new_input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
-        return new_input_ids, next_tokens
+        flag, concat_tokens = ds_scheduler.pass_scheduler(request_id, next_tokens)
+        if flag:
+            new_input_ids = torch.cat([input_ids, concat_tokens], dim=-1)
+            return new_input_ids, concat_tokens, request_id
+        else:
+            return None, None, request_id
 
     input_ids = batched_ids['input_ids']
     # prepare the logits processor
@@ -152,41 +132,49 @@ if __name__ == '__main__':
         prefix_allowed_tokens_fn=None,
         logits_processor=logits_processor,
     )
+    # watch whether 
     # generate input token
-    request_token = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=1)
-    request_token2 = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=2)
+    request_token_queues = []
+    input_id_dict = {}
+    for request_id, prefill_bs_indexes in prefill_bs_indexes.items():
+        for idx, prefill_bs_index in enumerate(prefill_bs_indexes):
+            current_sub_request_batch_ids = sample_text_dict[request_id][idx]
+            if request_id not in input_id_dict:
+                input_id_dict[request_id] = current_sub_request_batch_ids['input_ids']
+            else:
+                input_id_dict[request_id] = torch.cat([input_id_dict[request_id], current_sub_request_batch_ids['input_ids']], dim=0)
+            # print(current_sub_request_batch_ids['input_ids'].shape)
+            request_token = model_pre_and_post.preprocess(**current_sub_request_batch_ids, use_cache=True, request_id=request_id, batch_index=prefill_bs_index)
+            request_token_queues.append(request_token)
 
-    # print(request_token)
-    # init kv cache for all requests
-    for k_model in model_packs:
-        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
-        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=2)
+        # init kv cache for all requests
+        for k_model in model_packs:
+            k_model.init_kv_cache(decoder_bss[request_id], prompt_length, num_tokens_to_generate, request_id=request_id)
 
-    original_token = copy.deepcopy(input_ids)
-    input_ids2 = copy.deepcopy(input_ids)
-
+    new_queue = []
+    # token generation
     for i in range(num_tokens_to_generate):
-        new_input_ids, next_token = generate_one_token(request_token, input_ids)
-        new_input_ids2, next_token2 = generate_one_token(request_token2, input_ids2)
-        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_token, use_cache=True, request_id=1)
-        request_token2 = model_pre_and_post.preprocess_one_token(new_input_ids, next_token2, use_cache=True, request_id=2)
-        # print("KV Cache Size 2: ", get_iter_variable_size(model.model.decoder.kv_cache, unit='MB'))
-
-        input_ids = new_input_ids
-        input_ids2 = new_input_ids2
-        # print("token generated: ", i)
-
-
-    print(original_token.shape, new_input_ids.shape, new_input_ids2.shape)
+        while request_token_queues:
+            request_token = request_token_queues.pop(0)
+            input_ids = input_id_dict[request_token[-2].item()]
+            new_input_ids, next_token, request_id = generate_one_token(request_token, input_ids)
+            if new_input_ids is not None:
+                request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_token, use_cache=True, request_id=request_id)
+                input_id_dict[request_id] = new_input_ids
+                new_queue.append(request_token)
+        request_token_queues = [token for token in new_queue]
+        new_queue = []
+        print(f"generated {i}-th token")
     # print model 1, 2, 3 size in MB
     print("Model 1 size: ", get_model_size_cuda(model.model, 'MB'))
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB'))
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB'))
 
-    result_one_time = tokenizer.batch_decode(new_input_ids, skip_special_tokens=True)
-    result_one_time2 = tokenizer.batch_decode(new_input_ids2, skip_special_tokens=True)
-    print("Onetime Run: ", result_one_time)
-    print("Onetime Run 2: ", result_one_time2)
+
+    print(batched_ids['input_ids'].shape)
+    for request, input_id in input_id_dict.items():
+        print("Request: ", request)
+        print(tokenizer.batch_decode(input_id, skip_special_tokens=True))
 
     
 
