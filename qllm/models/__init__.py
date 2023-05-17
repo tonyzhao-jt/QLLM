@@ -4,6 +4,18 @@ from .BLOOM import bloom, BloomForCausalLMSeq, BloomBlockSharded
 
 import torch
 
+
+def create_model_config(model_name, model_size):
+    if model_name == 'opt':
+        model_cards = opt.model_cards
+        assert model_size in model_cards, f"model size {model_size} is not in model cards {model_cards.keys()}"
+        config = model_cards[model_size]
+    elif model_name == 'bloom':
+        model_cards = bloom.model_cards
+        assert model_size in model_cards, f"model size {model_size} is not in model cards {model_cards.keys()}"
+        config = model_cards[model_size]
+    return config
+
 def create_empty_model(model_name, model_size, torch_dtype=torch.float16):
     if model_name == 'opt':
         model_cards = opt.model_cards

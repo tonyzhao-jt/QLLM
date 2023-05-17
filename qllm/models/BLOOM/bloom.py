@@ -80,6 +80,8 @@ def load_pretrained_from_size(model_size, dtype=torch.float16, cache_dir=None):
     for key in AVAILABLE_MAP_keys:
         if str(model_size) in key:
             return load_pretained_model_from_net(key, dtype=dtype, cache_dir=cache_dir)
+        if model_size == '176b':
+            return load_pretained_model_from_net('bigscience/bloom', dtype=dtype, cache_dir=cache_dir)
     raise Exception(f"model size {model_size} not available")
 
 def get_available_pretained_models():
