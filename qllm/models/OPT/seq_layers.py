@@ -648,7 +648,7 @@ class OPTMLP(nn.Module):
         #         hidden_states = hidden_states.to(torch.float32) # layernorm Q takes fp32
         #     hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
+        # hidden_states = self.activation_fn(hidden_states)
 
         hidden_states = self.fc2(hidden_states)
         # no drop out for inference
@@ -855,6 +855,12 @@ class OPTDecoderLayerSharded(nn.Module):
                     self.mlp.fc1, fc1_input_scale, fc2_input_scale)
                     self.mlp.fc2 = W8A8BFP32OFP32Linear.from_float(
                     self.mlp.fc2, fc2_input_scale)
+
+                    perf_mode = os.environ['PERF_MODE'] == "1"
+                    if perf_mode:
+                        # randomly init all weight involved
+                        init_weight_bias_with_rand(self.mlp.fc1)
+                        init_weight_bias_with_rand(self.mlp.fc2)
                 else:
                     if bit == "8:tc-li":
                         bit = 8                    

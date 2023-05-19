@@ -112,7 +112,12 @@ class BloomMLP(nn.Module):
             tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
         
         hidden_states_dtype = hidden_states.dtype
-        hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
+        # TODO: add int8 gelu later.
+        # hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
+        if hidden_states.dtype == torch.int8:
+            hidden_states = self.dense_h_to_4h(hidden_states)
+        else:
+            hidden_states = self.gelu_impl(self.dense_h_to_4h(hidden_states))
         hidden_states = hidden_states.to(hidden_states_dtype)
 
         if self.pretraining_tp > 1 and self.slow_but_exact:
