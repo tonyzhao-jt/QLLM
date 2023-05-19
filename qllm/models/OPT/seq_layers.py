@@ -1164,8 +1164,8 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
             self.layers[layer_idx].eval() # use eval mode
             # directly move to device
-            if device is not None:
-                self.layers[layer_idx] = self.layers[layer_idx].to(device)
+        if device is not None:
+            self.layers = self.layers.to(device)
     
 
 
