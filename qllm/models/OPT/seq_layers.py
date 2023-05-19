@@ -678,8 +678,6 @@ class OPTDecoderLayerSharded(nn.Module):
         self.self_attn_layer_norm = nn.LayerNorm(
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
-        # change the name to self.self_attention to be consistent with the original code
-        self.self_attention = self.self_attn
 
         self.mlp = OPTMLP(config)
 
