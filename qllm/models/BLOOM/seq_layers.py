@@ -535,7 +535,8 @@ class Int8BLOOMAttention(nn.Module):
         k_shape = (b * self.num_heads, self.head_dim, max_seq_len)
         v_shape = (b * self.num_heads, max_seq_len, self.head_dim)
         params = list(self.query_key_value.parameters())
-        device = params[0].device
+        # device = params[0].device
+        device = self.q_proj.weight.device
         self.kv_cache[request_id] = (
             torch.empty(k_shape, dtype=torch_dtype, device=device),
             torch.empty(v_shape, dtype=torch_dtype, device=device)

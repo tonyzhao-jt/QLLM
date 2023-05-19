@@ -194,8 +194,8 @@ class Int8OPTAttention(nn.Module):
     def init_kv_cache(self, b, prompt_length, token_to_generate, request_id, torch_dtype=torch.float16, init_with_xavier=False):
         max_seq_len = prompt_length + token_to_generate
         kv_shape_2 = (b, self.num_heads, max_seq_len, self.head_dim, 2)
-        params = list(self.q_proj.parameters())
-        device = params[0].device
+        # params = list(self.q_proj.parameters())
+        device = self.q_proj.weight.device
         if isinstance(request_id, torch.Tensor):
             request_id = request_id.item()
         self.kv_cache[request_id] = torch.empty(kv_shape_2, dtype=torch_dtype, device=device)
