@@ -1,5 +1,6 @@
 from lptorch.utils import is_tensorcore_int8_available, is_tensorcore_int8_available_offline
-available_bits = [2, 3, 4, 8, '8:tc', 16]
+# available_bits = [2, 3, 4, 8, '8:tc', 16] # cutlass failed to perform right.
+available_bits = [2, 3, 4, 8, '8:tc-li', 16]
 def get_available_bits():
     cutlass_available = is_tensorcore_int8_available()
     if cutlass_available:
