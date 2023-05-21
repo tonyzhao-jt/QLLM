@@ -1,7 +1,10 @@
 from .LLaMa import llama
 from .OPT import opt, OPTForCausalLMSeq, OPTDecoderLayerSharded
 from .BLOOM import bloom, BloomForCausalLMSeq, BloomBlockSharded
-
+from transformers import (
+    BloomConfig,
+    OPTConfig,
+)
 import torch
 
 
@@ -47,6 +50,13 @@ def create_empty_decoder(model_name, model_size):
         h1 = config.hidden_size
         h2 = h1 * 4
     return decoder_layer, (h1, h2), config
+
+
+def return_config_name(model_config):
+    if isinstance(model_config, OPTConfig):
+        return 'opt'
+    elif isinstance(model_config, BloomConfig):
+        return 'bloom'
 
 def get_kv_size(decoder_instance):
     if isinstance(decoder_instance, OPTDecoderLayerSharded):
