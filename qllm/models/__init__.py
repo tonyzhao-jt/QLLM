@@ -58,6 +58,12 @@ def return_config_name(model_config):
     elif isinstance(model_config, BloomConfig):
         return 'bloom'
 
+def return_h1_h2(model_config):
+    if isinstance(model_config, OPTConfig):
+        return model_config.hidden_size, model_config.ffn_dim
+    elif isinstance(model_config, BloomConfig):
+        return model_config.hidden_size, model_config.hidden_size * 4
+
 def get_kv_size(decoder_instance):
     if isinstance(decoder_instance, OPTDecoderLayerSharded):
         return decoder_instance.kv_size
