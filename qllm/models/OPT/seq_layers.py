@@ -413,6 +413,10 @@ class OPTAttentionSeq(nn.Module):
         self.broadcast = broadcast_group
         self.embed_dim = self.embed_dim // split_k
     
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for request_id in self.kv_status:
+            self.kv_status[request_id][0] = 0 # reset the generated token number
 
     @torch.no_grad()
     def update_kv_cache(self, key_value_pair, request_id, batch_index=None):
@@ -1010,6 +1014,11 @@ class OPTDecoderSeq(OPTPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for layer in self.layers:
+            if layer is not None and layer.has_self_attention():
+                layer.self_attn._reset_kv_status()
     # Copied from transformers.models.bart.modeling_bart.BartDecoder._prepare_decoder_attention_mask
     @torch.no_grad()
     def _prepare_decoder_attention_mask(self, attention_mask, input_shape, inputs_embeds, past_key_values_length):
@@ -1403,6 +1412,10 @@ class OPTForCausalLMSeq(OPTForCausalLM):
     def get_decoder_layer_num(self):
         return self.model.decoder.get_decoder_layer_num()
     
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        self.model.decoder._reset_kv_status()
+
     # model sharders
     @torch.no_grad()
     def _verify_shard_strategy(self, shard_strategies):

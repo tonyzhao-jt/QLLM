@@ -266,6 +266,11 @@ class BloomAttention(nn.Module):
             nn.init.xavier_uniform_(self.kv_cache[request_id][0])
             nn.init.xavier_uniform_(self.kv_cache[request_id][1])
         self.kv_status[request_id] = [0, prompt_length]
+    
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for request_id in self.kv_status:
+            self.kv_status[request_id][0] = 0 # reset the generated token number
 
     def _split_heads(self, fused_qkv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -483,6 +488,11 @@ class Int8BLOOMAttention(nn.Module):
         int8_module.qkv_output_scale = qkv_output_scale
         int8_module.dense_scale = dense_scale
         return int8_module
+
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for request_id in self.kv_status:
+            self.kv_status[request_id][0] = 0 # reset the generated token number
 
     @torch.no_grad()
     def update_kv_cache(self, key_value_pair, request_id, batch_index=None):
@@ -1079,6 +1089,12 @@ class BloomModelSeq(BloomModel):
     def get_decoder_layer_num(self):
         return len(self.h)
 
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for layer in self.h:
+            if layer is not None and layer.has_self_attention():
+                layer.self_attention._reset_kv_status()
+
     def check_is_meta(self, layer):
         for name, param in layer.named_parameters():
             if 'weight' in name:
@@ -1291,6 +1307,10 @@ class BloomForCausalLMSeq(BloomForCausalLM):
     
     def get_decoder_layer_num(self):
         return self.transformer.get_decoder_layer_num()
+
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        self.transformer._reset_kv_status()
     # model sharders
     @torch.no_grad()
     def _verify_shard_strategy(self, shard_strategies):

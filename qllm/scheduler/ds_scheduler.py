@@ -1,19 +1,15 @@
 import threading
 import torch 
-
+import copy 
 from ..utils import partition_a_with_max_b
 class DSScheduler:
     def __init__(self, bz_prefill, decode_bss) -> None:
         self.bz_prefill = bz_prefill
         self.bz_decode = max(decode_bss)
         self.decode_bss = decode_bss
-        self.request_table = {}
-        self.request_token_generated = {}
-        self.num_prefill = 1
-        self.done_prefill = []
         self.lock = threading.Lock()
-        
         self.request_bs_status = {}
+        self.request_token_generated = {}
     
     def pass_scheduler(self, request, generated_token):
         self.lock.acquire()
@@ -35,6 +31,14 @@ class DSScheduler:
                 return True, torch.cat(self.request_token_generated[request], dim=0)
         self.lock.release()
         return False, False
+    
+    def reset_status(self):
+        self.lock.acquire()
+        for request, value in self.request_bs_status.items():
+            value['done'] = False
+            value['done_prefill_numbers'] = 0
+        self.request_token_generated.clear()
+        self.lock.release()
     
     def split_list_of_prompts(self, list_of_prompts):
         # assert len(list_of_prompts) % self.bz_prefill == 0, "list of prompts must be divisible by split_num"
