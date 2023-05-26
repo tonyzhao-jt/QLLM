@@ -105,7 +105,7 @@ class BloomMLP(nn.Module):
         # partition along the head dim
         self.broadcast = broadcast_group
 
-
+    @torch.no_grad()
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         if self.enable_tp and self.broadcast:
             group = qllm_tp_utils.get_tp_group()
@@ -313,6 +313,7 @@ class BloomAttention(nn.Module):
         # batch_size, seq_length, num_heads, head_dim -> batch_size, seq_length, num_heads * head_dim
         return x.reshape(batch_size, seq_length, self.num_heads * self.head_dim)
 
+    @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -885,6 +886,7 @@ class BloomBlockSharded(nn.Module):
                         quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
                             quantize_linear_module_with_bit(self.mlp, bit)
 
+        self.eval() # enure in eval mode
     @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, alibi=None, request_id=1, batch_index=None):
         # Layer norm at the beginning of the transformer layer.

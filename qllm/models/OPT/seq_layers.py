@@ -639,6 +639,7 @@ class OPTMLP(nn.Module):
         # partition along the head dim
         self.broadcast = broadcast_group
 
+    @torch.no_grad()
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
         hidden_states = self.final_layer_norm(hidden_states)
         if self.enable_tp and self.broadcast:
@@ -790,6 +791,7 @@ class OPTDecoderLayerSharded(nn.Module):
                             elif 'out_proj' in k:
                                 unique_id = caliber.man_set_unique_id(self.self_attn.out_proj)
                                 caliber.man_set_module_calib_data(self.self_attn.out_proj, fake_calib_data)
+                
 
                 if bit == "8:tc": # tensorcore int8
                     assert is_tensorcore_int8_available() and caliber.get_module_calib_data(self.self_attn.q_proj) is not None, \
@@ -883,7 +885,9 @@ class OPTDecoderLayerSharded(nn.Module):
                     else:
                         quantize_linear_module_with_bit(self.mlp, bit, caliber=caliber) if use_calib else \
                             quantize_linear_module_with_bit(self.mlp, bit)
-                
+
+        self.eval() # enure in eval mode
+            
     @torch.no_grad()
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, request_id=1, batch_index=None):
         residual = hidden_states

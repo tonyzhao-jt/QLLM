@@ -30,6 +30,7 @@ def create_empty_model(model_name, model_size, torch_dtype=torch.float16):
         assert model_size in model_cards, f"model size {model_size} is not in model cards {model_cards.keys()}"
         config = model_cards[model_size]
         loaded_llm_cpu = BloomForCausalLMSeq._from_config(config, torch_dtype=torch_dtype)
+    loaded_llm_cpu.eval()
     return loaded_llm_cpu
 
 def create_empty_decoder(model_name, model_size):
@@ -49,6 +50,7 @@ def create_empty_decoder(model_name, model_size):
         decoder_layer = BloomBlockSharded(config)
         h1 = config.hidden_size
         h2 = h1 * 4
+    decoder_layer.eval()
     return decoder_layer, (h1, h2), config
 
 
