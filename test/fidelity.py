@@ -13,17 +13,29 @@ import lptorch
 import torch
 import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
+from qllm.models import create_empty_model
+import os 
+from transformers import AutoTokenizer
 
+def init_tokenizer(model_name):
+    if model_name == 'opt':
+        return AutoTokenizer.from_pretrained("facebook/opt-66b")
+    elif model_name == 'bloom':
+        return AutoTokenizer.from_pretrained("bigscience/bloom")
 if __name__ == '__main__':
+    os.environ['SET_DECODERS_META'] = "1"
+    os.environ['PERF_MODE'] = "0"
+
     model_size = '66b'
-    opt_125M, tokenizer = opt.load_pretained_model_from_net(f'facebook/opt-{model_size}')
     max_length = 512
+    
     # sample text
+    weight_loaded_model = create_empty_model('opt', model_size)
+    tokenizer = init_tokenizer('opt')
     batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog. ", "Just test performance. How about you. ", \
                                                 "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], \
                                                 padding='max_length', max_length=max_length, return_tensors="pt")
     
-    weight_loaded_model = OPTForCausalLMSeq.from_pretrained(f"facebook/opt-{model_size}", torch_dtype=torch.float16)
 
     sharding_strategy = {
         '125m':{
@@ -195,52 +207,57 @@ if __name__ == '__main__':
                 3: {'shard': [0, 1], 'bits': [4, 4]},
                 4: {'shard': [0, 1], 'bits': [4, 4]},
                 5: {'shard': [0, 1], 'bits': [4, 4]},
-                6: {'shard': [0, 1], 'bits': [16, 16]},
-                7: {'shard': [0,1], 'bits': [16, 16]},
+                6: {'shard': [0, 1], 'bits': [4, 16]},
+                7: {'shard': [0,1], 'bits': [4, 4]},
                 8: {'shard': [0,1], 'bits': [3, 16]},
                 9: {'shard': [0,1], 'bits': [16, 3]},
                 10: {'shard': [0,1], 'bits': [8, 16]},
                 11: {'shard': [0,1], 'bits': [16, 8]},
-                12: {'shard': [0,1], 'bits': [16, 16]},
+                12: {'shard': [0,1], 'bits': [3, 3]},
                 13: {'shard': [0,1], 'bits': [4, 16]},
                 14: {'shard': [0,1], 'bits': [16, 4]},
-                15: {'shard': [0,1], 'bits': [16, 16]},
-                16: {'shard': [0,1], 'bits': [16, 16]},
-                17: {'shard': [0,1], 'bits': ['8:tc-li', 16]},
-                18: {'shard': [0,1], 'bits': [16, 16]},
-                19: {'shard': [0,1], 'bits': [16, 16]},
-                20: {'shard': [0,1], 'bits': [16, 16]},
-                21: {'shard': [0,1], 'bits': [16, 16]},
-                22: {'shard': [0,1], 'bits': [3, 16]},
-                23: {'shard': [0,1], 'bits': [16, 3]},
-                24: {'shard': [0,1], 'bits': [16, 16]},
-                25: {'shard': [0,1], 'bits': [3, 16]},
-                26: {'shard': [0,1], 'bits': [16, 16]},
-                27: {'shard': [0,1], 'bits': [16, 3]},
-                28: {'shard': [0,1], 'bits': [16, 16]},
-                29: {'shard': [0,1], 'bits': [16, 16]},
-                30: {'shard': [0,1], 'bits': [16, 16]},
+                15: {'shard': [0,1], 'bits': [4, 4]},
+                16: {'shard': [0,1], 'bits': [4, 4]},
+                17: {'shard': [0,1], 'bits': ['8:tc-li', 3]},
+                18: {'shard': [0,1], 'bits': [3, 3]},
+                
             },
             1: {
-                31: {'shard': [0,1], 'bits': [16, 16]},
-                32: {'shard': [0,1], 'bits': [16, '8:tc-li']},
-                33: {'shard': [0,1], 'bits': [16, 16]},
-                34: {'shard': [0,1], 'bits': [3, 16]},
-                35: {'shard': [0,1], 'bits': [3, 3]},
-                36: {'shard': [0,1], 'bits': [16, 16]},
-                37: {'shard': [0,1], 'bits': [16, 16]},
-                38: {'shard': [0,1], 'bits': [8, 16]},
-                39: {'shard': [0,1], 'bits': [16, 4]},
-                40: {'shard': [0,1], 'bits': [16, 16]},
-                41: {'shard': [0,1], 'bits': [16, 16]},
-                42: {'shard': [0,1], 'bits': [16, '8:tc-li']},
-                43: {'shard': [0,1], 'bits': [3, 16]},
-                44: {'shard': [0,1], 'bits': [3, 16]},
-                45: {'shard': [0,1], 'bits': [16, 16]},
-                46: {'shard': [0,1], 'bits': [16, 16]},
-                47: {'shard': [0,1], 'bits': [16, 16]}
+                19: {'shard': [0,1], 'bits': [4, 4]},
+                20: {'shard': [0,1], 'bits': [4, 4]},
+                21: {'shard': [0,1], 'bits': [3, 3]},
+                22: {'shard': [0,1], 'bits': [3, 16]},
+                23: {'shard': [0,1], 'bits': [16, 3]},
+                24: {'shard': [0,1], 'bits': [3, 4]},
+                25: {'shard': [0,1], 'bits': [3, 16]},
+                26: {'shard': [0,1], 'bits': [3, 3]},
+                27: {'shard': [0,1], 'bits': [16, 3]},
+                28: {'shard': [0,1], 'bits': [3, 3]},
+                29: {'shard': [0,1], 'bits': [3, 3]},
+                30: {'shard': [0,1], 'bits': [3, 3]},
+                31: {'shard': [0,1], 'bits': [4, 3]},
+                32: {'shard': [0,1], 'bits': [3, '8:tc-li']},
+                
             },
             2: {
+                33: {'shard': [0,1], 'bits': [3, 4]},
+                34: {'shard': [0,1], 'bits': [3, 16]},
+                35: {'shard': [0,1], 'bits': [3, 3]},
+                36: {'shard': [0,1], 'bits': [4, 4]},
+                37: {'shard': [0,1], 'bits': [4, 4]},
+                38: {'shard': [0,1], 'bits': [8, 16]},
+                39: {'shard': [0,1], 'bits': [16, 4]},
+                40: {'shard': [0,1], 'bits': [4, 4]},
+                41: {'shard': [0,1], 'bits': [3, 3]},
+                42: {'shard': [0,1], 'bits': [3, '8:tc-li']},
+                43: {'shard': [0,1], 'bits': [3, 16]},
+                44: {'shard': [0,1], 'bits': [3, 16]},
+                45: {'shard': [0,1], 'bits': [4, 4]},
+                46: {'shard': [0,1], 'bits': [4, 4]},
+                47: {'shard': [0,1], 'bits': [4, 4]},
+                
+            },
+            3: {
                 48: {'shard': [0,1], 'bits': [8, 16]},
                 49: {'shard': [0,1], 'bits': [16, 4]},
                 50: {'shard': [0,1], 'bits': [16, 16]},
@@ -258,6 +275,7 @@ if __name__ == '__main__':
                 62: {'shard': [0,1], 'bits': [16, 16]},
                 63: {'shard': [0,1], 'bits': [16, 16]}
             }
+
         }
         }
     
@@ -275,6 +293,7 @@ if __name__ == '__main__':
     model = weight_loaded_model.shard_model(sharding_strategy, 0)
     model_2 = weight_loaded_model.shard_model(sharding_strategy, 1)
     model_3 = weight_loaded_model.shard_model(sharding_strategy, 2)
+    model_4 = weight_loaded_model.shard_model(sharding_strategy, 3)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -282,7 +301,8 @@ if __name__ == '__main__':
     model.decoder_layers_to_device(device)
     model_2.decoder_layers_to_device(device)
     model_3.decoder_layers_to_device(device)
-    model_packs = [model, model_2, model_3]
+    model_4.decoder_layers_to_device(device)
+    model_packs = [model, model_2, model_3, model_4]
 
     # init KV cache
     num_tokens_to_generate = 100
@@ -296,6 +316,7 @@ if __name__ == '__main__':
             intermediate_results = model.decode(request_token)
             intermediate_results = model_2.decode(intermediate_results)
             intermediate_results = model_3.decode(intermediate_results)
+            intermediate_results = model_4.decode(intermediate_results)
 
         request_id = intermediate_results[-1]
         # preprocessing  
@@ -310,7 +331,7 @@ if __name__ == '__main__':
     input_ids = batched_ids['input_ids']
     # prepare the logits processor
     logits_processor = LogitsProcessorList()
-    generation_config = opt_125M.generation_config
+    generation_config = weight_loaded_model.generation_config
     inputs_tensor, model_input_name, model_kwargs = model._prepare_model_inputs(
         input_ids, generation_config.bos_token_id, {}
     )
@@ -349,13 +370,16 @@ if __name__ == '__main__':
     print("Generated tokens:", generated_length - original_length)
     # h1 = opt_125M.config.hidden_size
     # h2 = opt_125M.decoders.layers[0].fc2.weight.shape[0]
-    h2, h1 = opt_125M.model.decoder.layers[0].fc1.weight.shape
+    h2 = ffn_dim = 36864
+    h1 = hidden_size = 9216
+        #     hidden_size=9216,
+        # ffn_dim=36864,
     b = input_ids.shape[0]
     s = max_length
     n = num_tokens_to_generate
     request_num = 2
 
-    config = opt_125M.config
+    config = weight_loaded_model.config
     vocab_size = config.vocab_size
     max_position_embeddings = config.max_position_embeddings
     word_embed_proj_dim = config.word_embed_proj_dim
@@ -371,21 +395,24 @@ if __name__ == '__main__':
     print("Model 1 size: ", get_model_size_cuda(model.model, 'MB')[1])
     print("Model 2 size: ", get_model_size_cuda(model_2.model, 'MB')[1])
     print("Model 3 size: ", get_model_size_cuda(model_3.model, 'MB')[1])
+    print("Model 4 size: ", get_model_size_cuda(model_4.model, 'MB')[1])
     # estimated model size
     print("Estimated Model1", model_mem_estimator.calculate_model_occupation_of_partition(sharding_strategy[0], unit='MB')[1])
     print("Estimated Model2", model_mem_estimator.calculate_model_occupation_of_partition(sharding_strategy[1], unit='MB')[1])
     print("Estimated Model3", model_mem_estimator.calculate_model_occupation_of_partition(sharding_strategy[2], unit='MB')[1])
+    print("Estimated Model4", model_mem_estimator.calculate_model_occupation_of_partition(sharding_strategy[3], unit='MB')[1])
 
     # KV size
     print("Model 1 KV size: ", get_iter_variable_size(model.model.decoder.get_all_kv_cache_dict(), unit='MB'))
     print("Model 2 KV size: ", get_iter_variable_size(model_2.model.decoder.get_all_kv_cache_dict(), unit='MB'))
     print("Model 3 KV size: ", get_iter_variable_size(model_3.model.decoder.get_all_kv_cache_dict(), unit='MB'))
+    print("Model 4 KV size: ", get_iter_variable_size(model_4.model.decoder.get_all_kv_cache_dict(), unit='MB'))
 
     # estimator
     print("Estimated Model1 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[0], 'MB')[0])
     print("Estimated Model2 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[1], 'MB')[0])
     print("Estimated Model3 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[2], 'MB')[0])
-
+    print("Estimated Model4 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[3], 'MB')[0])
 
 
 

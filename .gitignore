@@ -11,3 +11,4 @@
 .ipynb_checkpoints
 .Trash-0/
 *.pkl
+*.trace.json
