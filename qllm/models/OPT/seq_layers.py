@@ -203,6 +203,11 @@ class Int8OPTAttention(nn.Module):
             nn.init.xavier_uniform_(self.kv_cache[request_id])
         self.kv_status[request_id] = [0, prompt_length]
 
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for request_id in self.kv_status:
+            self.kv_status[request_id][0] = 0 # reset the generated token number
+            
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
@@ -262,7 +267,7 @@ class Int8OPTAttention(nn.Module):
         # fp16 BMM. 
         query_states = query_states.half()
         key_states = key_states.half()
-        attn_weights = torch.bmm(query_states, key_states.transpose(1,2)).contiguous() 
+        attn_weights = torch.bmm(query_states, key_states.transpose(1,2))
         # try:
         #     if torch.any(torch.isnan(attn_weights)):
         #         print("nan in attn_weights")
@@ -308,11 +313,10 @@ class Int8OPTAttention(nn.Module):
                 bsz * self.num_heads, tgt_len, src_len)
 
         # fp16 bmm
-        scale = self.v_output_scale *  127 / self.out_output_scale
-        value_states = value_states.half() * scale
+        scale = self.v_output_scale.float() *  127 / self.out_output_scale.float()
+        value_states = value_states.half() * scale.half()
         attn_output = torch.bmm(attn_probs, value_states) # here the value is in fp16
-        attn_output = attn_output.to(torch.int8).contiguous()
-
+        attn_output = attn_output.to(torch.int8)
         # try:
         #     if torch.any(torch.isnan(attn_output)):
         #         print("nan in attn_weights")
@@ -1183,8 +1187,8 @@ class OPTDecoderSeq(OPTPreTrainedModel):
             self.layers[layer_idx].shard(sharding_strategy[layer_idx])
             self.layers[layer_idx].eval() # use eval mode
             # directly move to device
-        if device is not None:
-            self.layers = self.layers.to(device)
+            if device is not None:
+                self.layers = self.layers.to(device)
     
 
 

@@ -16,6 +16,8 @@ import copy
 from transformers import LogitsProcessorList, StoppingCriteriaList
 
 if __name__ == '__main__':
+    check_ = torch.tensor(1, device='cuda:0')
+    print("Initialized the context size;", torch.cuda.memory_reserved(0) / 1024 / 1024 / 1024, "GB")
     model_config = 'bigscience/bloom-560m'
     bloom_560m, tokenizer = bloom.load_pretained_model_from_net(model_config)
     # sample text
@@ -47,12 +49,12 @@ if __name__ == '__main__':
             10: {'shard': [0,1], 'bits': [4, 8]},
             11: {'shard': [0,1], 'bits': [16, 16]},
             # 350M
-            12: {'shard': [0,1], 'bits': ['8:tc', 16]},
+            12: {'shard': [0,1], 'bits': ['8:tc-li', 16]},
             13: {'shard': [0,1], 'bits': [8, 16]},
             14: {'shard': [0,1], 'bits': [16, 16]},
             15: {'shard': [0,1], 'bits': [16, 16]},
             16: {'shard': [0,1], 'bits': [16, 8]},
-            17: {'shard': [0,1], 'bits': [16, 16]},
+            17: {'shard': [0,1], 'bits': [16, '8:tc-li']},
             18: {'shard': [0,1], 'bits': [16, 8]},
             19: {'shard': [0,1], 'bits': [16, 16]},
             20: {'shard': [0,1], 'bits': [16, 16]},
@@ -104,42 +106,46 @@ if __name__ == '__main__':
         new_input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
         return new_input_ids, next_tokens
 
-    input_ids = batched_ids['input_ids']
-    # prepare the logits processor
-    logits_processor = LogitsProcessorList()
-    generation_config = bloom_560m.generation_config
-    inputs_tensor, model_input_name, model_kwargs = model._prepare_model_inputs(
-        input_ids, generation_config.bos_token_id, {}
-    )
-    input_ids_seq_length = input_ids.shape[-1]
-    # 8. prepare distribution pre_processing samplers
-    logits_processor = model._get_logits_processor(
-        generation_config=generation_config,
-        input_ids_seq_length=input_ids_seq_length,
-        encoder_input_ids=inputs_tensor,
-        prefix_allowed_tokens_fn=None,
-        logits_processor=logits_processor,
-    )
-    # generate input token
-    request_token = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=1)
-    request_token2 = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=2)
+    from torch.profiler import profile, record_function, ProfilerActivity
+    with profile(activities=[ProfilerActivity.CPU],
+        profile_memory=True, record_shapes=True, on_trace_ready=torch.profiler.tensorboard_trace_handler('./log')) as prof:
+        input_ids = batched_ids['input_ids']
+        # prepare the logits processor
+        logits_processor = LogitsProcessorList()
+        generation_config = bloom_560m.generation_config
+        inputs_tensor, model_input_name, model_kwargs = model._prepare_model_inputs(
+            input_ids, generation_config.bos_token_id, {}
+        )
+        input_ids_seq_length = input_ids.shape[-1]
+        # 8. prepare distribution pre_processing samplers
+        logits_processor = model._get_logits_processor(
+            generation_config=generation_config,
+            input_ids_seq_length=input_ids_seq_length,
+            encoder_input_ids=inputs_tensor,
+            prefix_allowed_tokens_fn=None,
+            logits_processor=logits_processor,
+        )
+        # generate input token
+        request_token = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=1)
+        request_token2 = model_pre_and_post.preprocess(**batched_ids, use_cache=True, request_id=2)
 
-    # init kv cache for all requests
-    for k_model in model_packs:
-        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
-        k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=2)
-    
-    original_token = copy.deepcopy(input_ids)
-    input_ids2 = copy.deepcopy(input_ids)
-    for i in range(num_tokens_to_generate):
-        new_input_ids, next_token = generate_one_token(request_token, input_ids)
-        new_input_ids2, next_token2 = generate_one_token(request_token2, input_ids2)
-        request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_token, use_cache=True, request_id=1)
-        request_token2 = model_pre_and_post.preprocess_one_token(new_input_ids, next_token2, use_cache=True, request_id=2)
+        # init kv cache for all requests
+        for k_model in model_packs:
+            k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=1)
+            k_model.init_kv_cache(bs, prompt_length, num_tokens_to_generate, request_id=2)
+        
+        original_token = copy.deepcopy(input_ids)
+        input_ids2 = copy.deepcopy(input_ids)
+        
+        for i in range(num_tokens_to_generate):
+            new_input_ids, next_token = generate_one_token(request_token, input_ids)
+            new_input_ids2, next_token2 = generate_one_token(request_token2, input_ids2)
+            request_token = model_pre_and_post.preprocess_one_token(new_input_ids, next_token, use_cache=True, request_id=1)
+            request_token2 = model_pre_and_post.preprocess_one_token(new_input_ids, next_token2, use_cache=True, request_id=2)
 
-        input_ids = new_input_ids
-        input_ids2 = new_input_ids2
-
+            input_ids = new_input_ids
+            input_ids2 = new_input_ids2
+    prof.export_chrome_trace("./log/bloom_mem.json")
     # generated token size
     original_length = original_token.shape[1]
     generated_length = input_ids.shape[1]
@@ -184,6 +190,15 @@ if __name__ == '__main__':
     print("Estimated Model1 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[0], 'MB')[0])
     print("Estimated Model2 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[1], 'MB')[0])
     print("Estimated Model3 KV:", request_num * model_mem_estimator.calculate_kv_occupation_of_partition(sharding_strategy[2], 'MB')[0])
+
+    # total size 
+    mem_list = [get_model_size_cuda(model_all, 'MB')[0] for model_all in model_packs]
+    kv_all = [get_iter_variable_size(model_all.transformer.get_all_kv_cache_dict(), unit='MB') for model_all in model_packs]
+    print("Total size", sum(mem_list) + sum(kv_all))
+    # max memory
+    print("Max memory: ", torch.cuda.max_memory_allocated() / 1024 / 1024 / 1024, "GB")
+    # overall cuda memory
+    print("Overall cuda memory: ", torch.cuda.memory_reserved() / 1024 / 1024 / 1024, "GB")
 
 
 

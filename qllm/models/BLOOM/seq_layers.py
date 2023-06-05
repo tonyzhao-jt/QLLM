@@ -562,6 +562,10 @@ class Int8BLOOMAttention(nn.Module):
             nn.init.xavier_uniform_(self.kv_cache[request_id][1])
         self.kv_status[request_id] = [0, prompt_length]
 
+    @torch.no_grad()
+    def _reset_kv_status(self):
+        for request_id in self.kv_status:
+            self.kv_status[request_id][0] = 0 # reset the generated token number
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()

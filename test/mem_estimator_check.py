@@ -82,7 +82,7 @@ if __name__ == '__main__':
         }
     } 
             
-        }
+    }
     
     sharding_strategy = sharding_strategy[model_size]
 

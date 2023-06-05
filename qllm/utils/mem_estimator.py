@@ -22,6 +22,7 @@ class ModelMemEstimator:
         if self.vocab_size is None:
             print("Token embedding dim is not specified")
             return 0
+        # import pdb; pdb.set_trace()
         # calculate each embedding size
         # 32 size
         token_embedding_size = self.vocab_size * self.word_embed_proj_dim * 4
