@@ -4,6 +4,7 @@ from .BLOOM import bloom, BloomForCausalLMSeq, BloomBlockSharded
 from transformers import (
     BloomConfig,
     OPTConfig,
+    AutoTokenizer,
 )
 import torch
 
@@ -53,6 +54,33 @@ def create_empty_decoder(model_name, model_size):
     decoder_layer.eval()
     return decoder_layer, (h1, h2), config
 
+def bare_load_pretrained_from_size(model_name, model_size, torch_dtype=torch.float16):
+    if model_name == 'opt':
+        (loaded_llm_cpu, tokenizer), key = opt.load_pretrained_from_size(model_size, dtype=torch_dtype)
+    elif model_name == 'bloom':
+        (loaded_llm_cpu, tokenizer), key = bloom.load_pretrained_from_size(model_size, dtype=torch_dtype)
+    loaded_llm_cpu.eval()
+    return loaded_llm_cpu, tokenizer, key
+
+def load_qllm_weight(QLLM_LM, model_name, model_size, target_storage_folder, torch_dtype, key=None):
+    import os 
+    if target_storage_folder is not None:
+        path = os.path.join(target_storage_folder, f"{model_name}_{model_size}")
+        return QLLM_LM.from_pretrained(path, torch_dtype=torch_dtype)
+    assert key, "key must be provided if target_storage_folder is None"
+    return QLLM_LM.from_pretrained(key, torch_dtype=torch_dtype)
+
+def qllm_load_pretrained_from_size(model_name, model_size, torch_dtype=torch.float16, target_storage_folder=None):
+    if model_name == 'opt':
+        key = opt.get_model_size_key(model_size)
+        QLLM_LM = OPTForCausalLMSeq
+    elif model_name == 'bloom':
+        key = bloom.get_model_size_key(model_size)
+        QLLM_LM = BloomForCausalLMSeq
+    tokenizer = AutoTokenizer.from_pretrained(key)
+    loaded_llm_cpu = load_qllm_weight(QLLM_LM, model_name, model_size, target_storage_folder, torch_dtype, key=key)
+    loaded_llm_cpu.eval()
+    return loaded_llm_cpu, tokenizer, key
 
 def return_config_name(model_config):
     if isinstance(model_config, OPTConfig):

@@ -158,15 +158,25 @@ class Int8OPTAttention(nn.Module):
         if batch_index is not None:
             start_batch_index = batch_index[0].item()
             end_batch_index = batch_index[1].item()
-            self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 0].copy_( \
-                key_value_pair[0][:, :, cur_token_length, :])
-            self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 1].copy_( \
-                key_value_pair[1][:, :, cur_token_length, :])
+            if prev_token_length == 0: # prefill stage
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, :cur_token_length+1, :, 0].copy_( \
+                    key_value_pair[0])
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, :cur_token_length+1, :, 1].copy_( \
+                    key_value_pair[1])
+            else:
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 0].copy_( \
+                    key_value_pair[0][:, :, cur_token_length, :])
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 1].copy_( \
+                    key_value_pair[1][:, :, cur_token_length, :])
             if end_batch_index == self.kv_cache[request_id].shape[0]:
                 self.kv_status[request_id][0] += 1 # finish prefill
         else:
-            self.kv_cache[request_id][:, :, cur_token_length, :, 0].copy_(key_value_pair[0][:, :, cur_token_length, :])
-            self.kv_cache[request_id][:, :, cur_token_length, :, 1].copy_(key_value_pair[1][:, :, cur_token_length, :])
+            if prev_token_length == 0: # prefill stage
+                self.kv_cache[request_id][:, :, :cur_token_length+1, :, 0].copy_(key_value_pair[0])
+                self.kv_cache[request_id][:, :, :cur_token_length+1, :, 1].copy_(key_value_pair[1])
+            else: # decode stage
+                self.kv_cache[request_id][:, :, cur_token_length, :, 0].copy_(key_value_pair[0][:, :, cur_token_length, :])
+                self.kv_cache[request_id][:, :, cur_token_length, :, 1].copy_(key_value_pair[1][:, :, cur_token_length, :])
             # update token length
             if not self.profile:
                 self.kv_status[request_id][0] += 1
@@ -436,16 +446,25 @@ class OPTAttentionSeq(nn.Module):
         if batch_index is not None:
             start_batch_index = batch_index[0].item()
             end_batch_index = batch_index[1].item()
-            self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 0].copy_( \
-                key_value_pair[0][:, :, cur_token_length, :])
-            self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 1].copy_( \
-                key_value_pair[1][:, :, cur_token_length, :])
-
+            if prev_token_length == 0: # prefill stage
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, :cur_token_length+1, :, 0].copy_( \
+                    key_value_pair[0])
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, :cur_token_length+1, :, 1].copy_( \
+                    key_value_pair[1])
+            else:
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 0].copy_( \
+                    key_value_pair[0][:, :, cur_token_length, :])
+                self.kv_cache[request_id][start_batch_index:end_batch_index, :, cur_token_length, :, 1].copy_( \
+                    key_value_pair[1][:, :, cur_token_length, :])
             if end_batch_index == self.kv_cache[request_id].shape[0]:
                 self.kv_status[request_id][0] += 1 # finish prefill
         else:
-            self.kv_cache[request_id][:, :, cur_token_length, :, 0].copy_(key_value_pair[0][:, :, cur_token_length, :])
-            self.kv_cache[request_id][:, :, cur_token_length, :, 1].copy_(key_value_pair[1][:, :, cur_token_length, :])
+            if prev_token_length == 0: # prefill stage
+                self.kv_cache[request_id][:, :, :cur_token_length+1, :, 0].copy_(key_value_pair[0])
+                self.kv_cache[request_id][:, :, :cur_token_length+1, :, 1].copy_(key_value_pair[1])
+            else: # decode stage
+                self.kv_cache[request_id][:, :, cur_token_length, :, 0].copy_(key_value_pair[0][:, :, cur_token_length, :])
+                self.kv_cache[request_id][:, :, cur_token_length, :, 1].copy_(key_value_pair[1][:, :, cur_token_length, :])
             # update token length
             if not self.profile:
                 self.kv_status[request_id][0] += 1
@@ -645,26 +664,29 @@ class OPTMLP(nn.Module):
 
     @torch.no_grad()
     def forward(self, hidden_states: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.final_layer_norm(hidden_states)
+        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
+        if self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
         if self.enable_tp and self.broadcast:
             group = qllm_tp_utils.get_tp_group()
             tp._broad_cast(hidden_states, self.global_rank, self.tp_index, group) # broadcast hidden states
 
         hidden_states_shape = hidden_states.shape
-        # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        # if self.do_layer_norm_before:
-        #     if isinstance(self.final_layer_norm, LayerNormQ):
-        #         hidden_states = hidden_states.to(torch.float32) # layernorm Q takes fp32
-        #     hidden_states = self.final_layer_norm(hidden_states)
+        
         hidden_states = self.fc1(hidden_states)
-        # hidden_states = self.activation_fn(hidden_states)
-
+        hidden_states = self.activation_fn(hidden_states)
         hidden_states = self.fc2(hidden_states)
+        
         # no drop out for inference
         if self.enable_tp:
             # gather result
             group = qllm_tp_utils.get_tp_group()
             hidden_states = tp._all_reduce_sum(hidden_states, group)
+        # 350m applies layer norm AFTER attention
+        if not self.do_layer_norm_before:
+            hidden_states = self.final_layer_norm(hidden_states)
+
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = (residual + hidden_states.to(residual.dtype)).view(hidden_states_shape)
 
@@ -688,15 +710,16 @@ class OPTDecoderLayerSharded(nn.Module):
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
 
-        self.mlp = OPTMLP(config)
 
         self.partitions = [0,1] # by default, contain both self attention and FFN
         # prepare a forward tokenizer for ffn only quiantized case
 
-        # for weight loading. remove this after load.
-        self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
-        self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
-        self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
+        # change to a single mlp layer
+        self.mlp = OPTMLP(config)
+        self.mlp.do_layer_norm_before = self.do_layer_norm_before
+        # self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
+        # self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
+        # self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
 
     def set_partition(self, partitions):
         self.partitions = [i for i in partitions]
@@ -762,9 +785,6 @@ class OPTDecoderLayerSharded(nn.Module):
             del self.self_attn_layer_norm
 
         if 1 not in self.partitions:
-            del self.fc1
-            del self.fc2
-            del self.final_layer_norm
             del self.mlp
         
         self.test_input_shape = {}
@@ -831,14 +851,6 @@ class OPTDecoderLayerSharded(nn.Module):
                 
             elif partition == 1:
                 bit = bits[idx]
-                # OPT: copy weight from fc1 to mlp.fc1 fc2 to mlp.fc2, layer_norm to mlp.layer_norm
-                self.mlp.fc1.weight.data.copy_(self.fc1.weight)
-                self.mlp.fc1.bias.data.copy_(self.fc1.bias)
-                self.mlp.fc2.weight.data.copy_(self.fc2.weight)
-                self.mlp.fc2.bias.data.copy_(self.fc2.bias)
-                self.mlp.final_layer_norm.weight.data.copy_(self.final_layer_norm.weight)
-                self.mlp.final_layer_norm.bias.data.copy_(self.final_layer_norm.bias)
-                del self.fc1, self.fc2, self.final_layer_norm
                 # case that only ffn exists, prepare a forward quantizer here
                 if not caliber.fake:
                     input_shape = caliber.get_module_input_shape(self.mlp.fc1)
@@ -896,9 +908,9 @@ class OPTDecoderLayerSharded(nn.Module):
     def SELFATTEN_PART(self, hidden_states:torch.Tensor, attention_mask, layer_head_mask, request_id=1, batch_index=None):
         residual = hidden_states
         # 125m, 1.7B, ..., 175B applies layer norm BEFORE attention
-        # if self.do_layer_norm_before:
-        #     hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn_layer_norm(hidden_states)
+        if self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
+        # hidden_states = self.self_attn_layer_norm(hidden_states)
         # Self Attention
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -910,9 +922,9 @@ class OPTDecoderLayerSharded(nn.Module):
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states.to(residual.dtype)
 
-        # 350m applies layer norm AFTER attention
-        # if not self.do_layer_norm_before:
-        #     hidden_states = self.self_attn_layer_norm(hidden_states)
+        # 350m applies layernorm AFTER attention
+        if not self.do_layer_norm_before:
+            hidden_states = self.self_attn_layer_norm(hidden_states)
         
         outputs = (hidden_states,)
 
@@ -1072,18 +1084,6 @@ class OPTDecoderSeq(OPTPreTrainedModel):
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # input_len = input_ids.shape[1]
-        # from torch.nn.functional import pad
-        # if input_len % 16 != 0:
-        #     # <pad> is 1
-        #     padding_len = 16 - input_len % 16
-        #     input_ids = pad(input_ids, (0, padding_len), value=1)
-        #     if attention_mask is not None:
-        #         attention_mask = pad(attention_mask, (0, padding_len), value=0)
-        #     self.input_len = input_len 
-        # else:
-        #     self.input_len = None
-
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both decoder_input_ids and decoder_inputs_embeds at the same time")
@@ -1095,18 +1095,26 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
 
-        # past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        batch_size, seq_length = input_shape
+        past_key_values_length = past_key_values[0][0].shape[2] if past_key_values is not None else 0
+        # required mask seq length can be calculated via length of past
+        mask_seq_length = past_key_values_length + seq_length
+
         # embed positions
         if attention_mask is None:
-            attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-        pos_embeds = self.embed_positions(attention_mask, past_key_values_length)
-        attention_mask = self._prepare_decoder_attention_mask(
+            attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
+        elif attention_mask.shape[1] != mask_seq_length:
+            raise ValueError(
+                f"The provided attention mask has length {attention_mask.shape[1]}, but its length should be "
+                f"{mask_seq_length} (sum of the lengths of current and past inputs)"
+            )
+        causal_attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, input_shape, inputs_embeds, past_key_values_length
         )
+        pos_embeds = self.embed_positions(attention_mask, past_key_values_length)           
 
         if self.project_in is not None:
             inputs_embeds = self.project_in(inputs_embeds)
@@ -1133,6 +1141,7 @@ class OPTDecoderSeq(OPTPreTrainedModel):
         return {
             "hidden_states": hidden_states,
             "attention_mask": attention_mask,
+            "causal_attention_mask": causal_attention_mask,
             "head_mask": head_mask,
             "past_key_values": past_key_values,
             "output_hidden_states": output_hidden_states,
@@ -1360,26 +1369,37 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         self.post_init()
 
     @torch.no_grad()
-    def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1, batch_index=None):
+    def preprocess_one_token(self, new_input_ids, next_tokens, attention_mask=None, use_cache=True, request_id=1, batch_index=None):
         with torch.no_grad():
-            input_ids_seq_length = new_input_ids.shape[1] - 1
+            batch_size, mask_seq_length = new_input_ids.shape
             embed_tokens = self.model.decoder.embed_tokens
-            pos_embeds = self.model.decoder.embed_positions
+            embed_pos = self.model.decoder.embed_positions
             # embed the new input tokens
+            inputs_embeds = embed_tokens(next_tokens)
+            inputs_embeds = inputs_embeds.view(batch_size, 1, -1)
 
-            inputs_embeds = embed_tokens(new_input_ids)
-            next_token_embeds = embed_tokens(next_tokens)
-            bs = next_token_embeds.size(0)
-            input_shape = (bs, 1)
-            next_token_embeds = next_token_embeds.view(bs, 1, -1)
-            attention_mask = torch.ones(inputs_embeds.shape[:2], dtype=torch.bool, device=inputs_embeds.device)
-            p_embeds = pos_embeds(attention_mask, input_ids_seq_length)
-            attention_mask = self.model.decoder._prepare_decoder_attention_mask(attention_mask, input_shape, inputs_embeds, input_ids_seq_length)
-            # attention_mask[:, -1] = torch.finfo(attention_mask.dtype).min
+            input_shape = (batch_size, 1)
+            past_key_values_length = mask_seq_length - 1
+
+            # embed positions
+            if attention_mask is None:
+                attention_mask = torch.ones(batch_size, mask_seq_length, device=inputs_embeds.device)
+            else:
+                # add one column
+                # https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/generation/utils.py#L774C17-L776C18
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+                # attention_mask = attention_mask.to(hidden_states.device)
+            causal_attention_mask = self.model.decoder._prepare_decoder_attention_mask(
+                attention_mask, input_shape, inputs_embeds, past_key_values_length
+            )
+            pos_embeds = embed_pos(attention_mask, past_key_values_length) 
             if self.model.decoder.project_in is not None:
-                next_token_embeds = self.model.decoder.project_in(next_token_embeds)
-            next_token_embeds = next_token_embeds + p_embeds
-            request_token = (next_token_embeds, attention_mask) + (None, use_cache, request_id, batch_index) 
+                inputs_embeds = self.model.decoder.project_in(inputs_embeds)    
+            next_token_embeds = inputs_embeds + pos_embeds  
+            mask_and_cache = (attention_mask, causal_attention_mask, None, ) 
+            request_token = (next_token_embeds,) + mask_and_cache + (use_cache, request_id, batch_index) 
             request_token = qllm_utils.object_to_tensor(request_token)
             return request_token
     
@@ -1408,10 +1428,11 @@ class OPTForCausalLMSeq(OPTForCausalLM):
 
         # add broadcast here for dist
         attention_mask = pre_result['attention_mask']
+        casual_attention_mask = pre_result['causal_attention_mask']
         head_mask = pre_result['head_mask']
         use_cache = use_cache
-        mask_and_cache = (attention_mask, head_mask, use_cache) 
-        pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, batch_index, )
+        mask_and_cache = (attention_mask, casual_attention_mask, head_mask, ) 
+        pre_result = (pre_result['hidden_states'],) + mask_and_cache + (use_cache, request_id, batch_index, )
 
         self.return_dict = return_dict
         pre_result = qllm_utils.object_to_tensor(pre_result)
@@ -1478,16 +1499,16 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         def shard_launcher(prev_result, module_shard):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
-            attention_mask, head_mask, use_cache, request_id, batch_index = prev_result[1:]
+            attention_mask, casual_attention_mask, head_mask, use_cache, request_id, batch_index = prev_result[1:]
 
             p_head_mask = qllm_utils.return_none_if_nan(head_mask)
-            p_attention_mask = qllm_utils.return_none_if_nan(attention_mask)
+            p_casual_attention_mask = qllm_utils.return_none_if_nan(casual_attention_mask)
             batch_index = qllm_utils.return_none_if_nan(batch_index)
 
             res = module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,
-                attention_mask=p_attention_mask,
+                attention_mask=p_casual_attention_mask,
                 head_mask=p_head_mask,
                 past_key_values=None,
                 use_cache=use_cache,
@@ -1508,7 +1529,7 @@ class OPTForCausalLMSeq(OPTForCausalLM):
         # head_mask, attention_mask should be passed with the pre_result
         # past_key_value should be stored within the model
         return_dict = self.return_dict
-        hidden_states, attention_mask, head_mask, use_cache, request_id, batch_index = results
+        hidden_states, attention_mask, casual_attention_mask, head_mask, use_cache, request_id, batch_index = results
         next_decoder_cache = None
         outputs = self.model.decoder.forward_post(
             hidden_states, next_decoder_cache, use_cache=use_cache, return_dict=return_dict

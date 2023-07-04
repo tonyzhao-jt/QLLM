@@ -108,11 +108,18 @@ def load_pretained_model_from_net(repo_name, dtype=torch.float16, cache_dir=None
     tokenizer = AutoTokenizer.from_pretrained(repo_name)
     return model, tokenizer
 
-def load_pretrained_from_size(model_size, dtype=torch.float16, cache_dir=None):
+def get_model_size_key(model_size):
     AVAILABLE_MAP_keys = list(AVAILABLE_MAP.keys())
     for key in AVAILABLE_MAP_keys:
         if str(model_size) in key:
-            return load_pretained_model_from_net(key, dtype=dtype, cache_dir=cache_dir)
+            return key
+    return None 
+
+def load_pretrained_from_size(model_size, dtype=torch.float16, cache_dir=None):
+    AVAILABLE_MAP_keys = list(AVAILABLE_MAP.keys())
+    key = get_model_size_key(model_size)
+    if key is not None:
+        return load_pretained_model_from_net(key, dtype=dtype, cache_dir=cache_dir), key
     raise Exception(f"model size {model_size} not available")
 
 def get_available_pretained_models():

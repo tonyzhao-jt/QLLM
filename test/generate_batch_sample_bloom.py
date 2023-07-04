@@ -21,8 +21,8 @@ if __name__ == '__main__':
     # sample text
     max_length = 512
     # sample text
-    batched_ids = tokenizer.batch_encode_plus(["Hi, where is my dog. ", "Just test performance. How about you. ", \
-                                                "The quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a"], \
+    batched_ids = tokenizer.batch_encode_plus(["Can you tell me something about the strawberry?", "Write a expression to describe the blue sky. ", \
+                                                "Accomplish the text: the quick brown fox jumps over the lazy dog. It's a beautiful day outside, the sun is shining and the birds are chirping. I feel like going for a."], \
                                                 padding='max_length', max_length=max_length, return_tensors="pt")
     
     weight_loaded_model = BloomForCausalLMSeq.from_pretrained(model_config, torch_dtype=torch.float16)
@@ -130,7 +130,7 @@ if __name__ == '__main__':
     bloom_560m = bloom_560m.cuda()
 
     # init KV cache
-    num_tokens_to_generate = 100
+    num_tokens_to_generate = 10
     bs, prompt_length = batched_ids['input_ids'].shape
     # becareful to use this one
     batched_ids = to_device_recursive(dict(batched_ids), device)
@@ -199,18 +199,19 @@ if __name__ == '__main__':
 
         input_ids = new_input_ids
         input_ids2 = new_input_ids2
+        print("generated token, ", i, ":", tokenizer.batch_decode(next_token, skip_special_tokens=True))
 
 
-    print(original_token.shape, new_input_ids.shape, new_input_ids2.shape)
-    # print model 1, 2, 3 size in MB
-    print("Model 1 size: ", get_model_size_cuda(model, 'MB'))
-    print("Model 2 size: ", get_model_size_cuda(model_2, 'MB'))
-    print("Model 3 size: ", get_model_size_cuda(model_3, 'MB'))
+    # print(original_token.shape, new_input_ids.shape, new_input_ids2.shape)
+    # # print model 1, 2, 3 size in MB
+    # print("Model 1 size: ", get_model_size_cuda(model, 'MB'))
+    # print("Model 2 size: ", get_model_size_cuda(model_2, 'MB'))
+    # print("Model 3 size: ", get_model_size_cuda(model_3, 'MB'))
 
     result_one_time = tokenizer.batch_decode(new_input_ids, skip_special_tokens=True)
     result_one_time2 = tokenizer.batch_decode(new_input_ids2, skip_special_tokens=True)
-    print("Onetime Run: ", result_one_time)
-    print("Onetime Run 2: ", result_one_time2)
+    # print("Onetime Run: ", result_one_time)
+    # print("Onetime Run 2: ", result_one_time2)
     
 
 

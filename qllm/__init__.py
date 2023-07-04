@@ -8,7 +8,7 @@ from . import nn
 from . import fast_download
 from .custom_generate import SequentialGenerate
 from .utils import get_available_bits, get_available_bits_offline
-
+from . import logging
 
 import os 
 os.environ['SET_DECODERS_META'] = "0" # whether to set the decoders' parameters to meta

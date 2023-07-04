@@ -215,13 +215,23 @@ class BloomAttention(nn.Module):
         if batch_index is not None:
             start_batch_index = batch_index[0].item() * self.num_heads
             end_batch_index = batch_index[1].item() * self.num_heads
-            self.kv_cache[request_id][0][start_batch_index:end_batch_index, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
-            self.kv_cache[request_id][1][start_batch_index:end_batch_index, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+            if prev_token_length == 0: # prefill stage
+                self.kv_cache[request_id][0][start_batch_index:end_batch_index, :, :cur_token_length + 1].copy_\
+                    (key_value_pair[0])
+                self.kv_cache[request_id][1][start_batch_index:end_batch_index, :cur_token_length + 1, :].copy_\
+                    (key_value_pair[1])
+            else:
+                self.kv_cache[request_id][0][start_batch_index:end_batch_index, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+                self.kv_cache[request_id][1][start_batch_index:end_batch_index, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
             if end_batch_index == self.kv_cache[request_id][0].shape[0]:
                 self.kv_status[request_id][0] += 1 # finish prefill
         else:
-            self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
-            self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
+            if prev_token_length == 0: # prefill stage
+                self.kv_cache[request_id][0][:, :, :cur_token_length + 1].copy_(key_value_pair[0])
+                self.kv_cache[request_id][1][:, :cur_token_length + 1, :].copy_(key_value_pair[1])
+            else: # decode stage
+                self.kv_cache[request_id][0][:, :, cur_token_length].copy_(key_value_pair[0][:, :, cur_token_length])
+                self.kv_cache[request_id][1][:, cur_token_length, :].copy_(key_value_pair[1][:, cur_token_length, :])
             # update token length
             if not self.profile:
                 self.kv_status[request_id][0] += 1
@@ -354,6 +364,7 @@ class BloomAttention(nn.Module):
 
         _, _, kv_length = key_layer.shape
 
+        # print(alibi.shape, query_layer.shape, key_layer.shape, value_layer.shape)
         # [batch_size * num_heads, q_length, kv_length]
         # we use `torch.Tensor.baddbmm` instead of `torch.baddbmm` as the latter isn't supported by TorchScript v1.11
         matmul_result = alibi.baddbmm(
@@ -1064,7 +1075,7 @@ class BloomModelSeq(BloomModel):
             attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
         else:
             attention_mask = attention_mask.to(hidden_states.device)
-
+            
         alibi = self.build_alibi_tensor(attention_mask, self.num_heads, dtype=hidden_states.dtype)
 
         causal_mask = self._prepare_attn_mask(
@@ -1075,7 +1086,8 @@ class BloomModelSeq(BloomModel):
 
         return {
             "hidden_states": hidden_states,
-            "attention_mask": causal_mask,
+            "attention_mask": attention_mask,
+            "causal_mask": causal_mask,
             "head_mask": head_mask,
             "past_key_values": past_key_values,
             "output_hidden_states": output_hidden_states,
@@ -1249,7 +1261,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         Same for all LLMs
     '''
     @torch.no_grad()
-    def preprocess_one_token(self, new_input_ids, next_tokens, use_cache=True, request_id=1, batch_index=None):
+    def preprocess_one_token(self, new_input_ids, next_tokens, attention_mask=None, use_cache=True, request_id=1, batch_index=None):
         with torch.no_grad():
             batch_size, seq_length = new_input_ids.shape
             embed_tokens = self.transformer.word_embeddings
@@ -1263,15 +1275,22 @@ class BloomForCausalLMSeq(BloomForCausalLM):
             seq_length_with_past = seq_length
             past_key_values_length = seq_length_with_past - 1
             input_shape = (batch_size, 1)
-            attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+
+            # update attention mask
+            if attention_mask is None:
+                attention_mask = torch.ones((batch_size, seq_length_with_past), device=hidden_states.device)
+            else:
+                # add one column
+                # https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/generation/utils.py#L774C17-L776C18
+                attention_mask = torch.cat(
+                    [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=-1
+                )
+                # attention_mask = attention_mask.to(hidden_states.device)
             num_heads = self.config.num_attention_heads
             alibi = self.transformer.build_alibi_tensor(attention_mask, num_heads, dtype=hidden_states.dtype)
-            causal_mask = self.transformer._prepare_attn_mask(
-                attention_mask,
-                input_shape=input_shape,
-                past_key_values_length=past_key_values_length,
-            )
-            mask_and_cache = (causal_mask, head_mask, alibi, use_cache) 
+            causal_mask = self.transformer._prepare_attn_mask(attention_mask,input_shape=input_shape, past_key_values_length=past_key_values_length,)
+
+            mask_and_cache = (attention_mask, causal_mask, head_mask, alibi, use_cache) 
             request_token = (hidden_states,) + mask_and_cache + (request_id, batch_index)
             request_token = qllm_utils.object_to_tensor(request_token)
             return request_token
@@ -1303,10 +1322,12 @@ class BloomForCausalLMSeq(BloomForCausalLM):
 
         # add broadcast here for dist
         attention_mask = pre_result['attention_mask']
+
+        causal_mask = pre_result['causal_mask']
         head_mask = pre_result['head_mask']
         alibi = pre_result['alibi']
         use_cache = use_cache
-        mask_and_cache = (attention_mask, head_mask, alibi, use_cache) 
+        mask_and_cache = (attention_mask, causal_mask, head_mask, alibi, use_cache) 
         pre_result = (pre_result['hidden_states'],) + mask_and_cache + (request_id, batch_index, )
         pre_result = qllm_utils.object_to_tensor(pre_result)
         return pre_result
@@ -1370,15 +1391,15 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         def shard_launcher(prev_result, module_shard):
             # length_prev_result = len(prev_result)
             hidden_states = prev_result[0]
-            attention_mask, head_mask, alibi, use_cache, request_id, batch_index = prev_result[1:]
+            attention_mask, causal_mask, head_mask, alibi, use_cache, request_id, batch_index = prev_result[1:]
             p_head_mask = qllm_utils.return_none_if_nan(head_mask)
-            p_attention_mask = qllm_utils.return_none_if_nan(attention_mask)
+            p_causal_mask = qllm_utils.return_none_if_nan(causal_mask)
             batch_index = qllm_utils.return_none_if_nan(batch_index)
 
             res = module_shard(
                 hidden_states=hidden_states,
                 next_decoder_cache=None,
-                attention_mask=p_attention_mask,
+                attention_mask=p_causal_mask,
                 head_mask=p_head_mask,
                 past_key_values=None,
                 use_cache=use_cache,
@@ -1462,7 +1483,7 @@ class BloomForCausalLMSeq(BloomForCausalLM):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         self.return_dict = return_dict
 
-        token_input = self.preprocess(input_ids, use_cache=True, request_id=1)
+        token_input = self.preprocess(input_ids, attention_mask=attention_mask, use_cache=True, request_id=1)
         transformer_outputs = self.decode(token_input)
         return self.postprocess(transformer_outputs)
     
