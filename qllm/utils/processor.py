@@ -5,7 +5,7 @@ def greedy_processor(model, input_ids, tokens_to_generate, max_prompt_length):
     logits_processor = LogitsProcessorList()
     generation_config = model.generation_config
     new_generation_config = GenerationConfig.from_model_config(model.config)
-    pad_token_id = new_generation_config.pad_token_id
+    pad_token_id = new_generation_config.pad_token_id if new_generation_config.pad_token_id is not None else 3 # by default to be 3 or 1
     generate_kwargs = dict(max_new_tokens=tokens_to_generate, do_sample=False)
     new_generation_config.update(**generate_kwargs)
     new_generation_config.validate()
