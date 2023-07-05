@@ -10,25 +10,26 @@ class DSScheduler:
         self.lock = threading.Lock()
         self.request_bs_status = {}
         self.request_token_generated = {}
-    
-    def pass_scheduler(self, request, generated_token):
+     
+    def pass_scheduler(self, request, generated_token, attention_mask):
         self.lock.acquire()
         request_status = self.request_bs_status[request]
         done = request_status['done']
         if done:
             self.lock.release()
-            return True, generated_token[:, None]
+            return True, generated_token[:, None], attention_mask
         else:
             if request not in self.request_token_generated:
-                self.request_token_generated[request] = [generated_token[:, None]]
+                self.request_token_generated[request] = [[generated_token[:, None]], [attention_mask]]
             else:
-                self.request_token_generated[request].append(generated_token[:, None])
+                self.request_token_generated[request][0].append(generated_token[:, None])
+                self.request_token_generated[request][1].append(attention_mask)
             process_batch_num = generated_token.shape[0]
             request_status['done_prefill_numbers'] += process_batch_num
             if request_status['done_prefill_numbers'] == request_status['bz']:
                 request_status['done'] = True
                 self.lock.release()
-                return True, torch.cat(self.request_token_generated[request], dim=0)
+                return True, torch.cat(self.request_token_generated[request][0], dim=0), torch.cat(self.request_token_generated[request][1], dim=0)
         self.lock.release()
         return False, False
     

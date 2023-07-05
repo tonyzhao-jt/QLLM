@@ -27,6 +27,9 @@ if __name__ == '__main__':
         "He has a",
         "Everyone is happy and I can",
     ]
+    # prompts = [
+    #     "What is the key to a successful career?"
+    # ]
 
     target_storage_folder = '/data/llms/converted_weights'
     # load model 
