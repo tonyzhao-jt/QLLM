@@ -31,7 +31,7 @@ class DSScheduler:
                 self.lock.release()
                 return True, torch.cat(self.request_token_generated[request][0], dim=0), torch.cat(self.request_token_generated[request][1], dim=0)
         self.lock.release()
-        return False, False
+        return False, False, False
     
     def reset_status(self):
         self.lock.acquire()
