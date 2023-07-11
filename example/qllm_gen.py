@@ -1,6 +1,5 @@
 
 from qllm.utils import batch_encode_plus, get_model_size_cuda,  to_device_recursive, greedy_processor
-from qllm.models import bloom, opt, qllm_load_pretrained_from_size
 import lptorch
 import torch
 import copy
@@ -8,6 +7,8 @@ import os
 
 from qllm.tp import utils as tp_utils
 from qllm.utils.argparser import model_sample_gen_argparser
+import qllm.utils as qllm_utils
+from qllm.models import qllm_load_pretrained_from_size, init_tokenizer,  create_empty_model
 
 # import sharding strategies helper
 from example_utils import create_uniform_sharding_strategies
@@ -37,10 +38,27 @@ if __name__ == '__main__':
         qllm_model, tokenizer, key = qllm_load_pretrained_from_size(model_name, model_size)
     elif model_name == 'opt':
         # use converted weight
-        path = os.path.join(target_storage_folder, f"{model_name}_{model_size}")
-        if not os.path.exists(path):
-            raise ValueError("Please run weight_convert.py first")
-        qllm_model, tokenizer, key = qllm_load_pretrained_from_size(model_name, model_size, target_storage_folder=target_storage_folder)
+        load_in_np = os.environ.get('LOAD_IN_NP', '0') == '1'
+        if load_in_np:
+            # specify the np weight folder
+            os.environ['NP_WEIGHT_FOLDER'] = os.environ.get('NP_WEIGHT_FOLDER', '/data/llms/converted_weights_np') + f"/{model_name}_{model_size}"
+            # load model with empty
+            os.environ['SET_DECODERS_META'] = "1"
+            # check path
+            if not os.path.exists(os.environ['NP_WEIGHT_FOLDER']):
+                raise ValueError("Please run weight_convert.py first")
+            qllm_model = create_empty_model(model_name, model_size)
+            qllm_utils.load_np_weight_opt_non_layer(os.environ['NP_WEIGHT_FOLDER'], qllm_model)
+            tokenizer, key = init_tokenizer(model_name, model_size)
+            # load weight through shard api
+            decoder_layer_nums = qllm_model.get_decoder_layer_num()
+            sharding_strategy = create_uniform_sharding_strategies(1, decoder_layer_nums, 16)
+            qllm_model.model.decoder._shard_decoders(sharding_strategy[0])
+        else:
+            path = os.path.join(target_storage_folder, f"{model_name}_{model_size}")
+            if not os.path.exists(path):
+                raise ValueError("Please run weight_convert.py first")
+            qllm_model, tokenizer, key = qllm_load_pretrained_from_size(model_name, model_size, target_storage_folder=target_storage_folder)
 
     batched_ids = batch_encode_plus(tokenizer, prompts, return_tensors="pt", max_length=max_prompt_length)
     decoder_layer_nums = qllm_model.get_decoder_layer_num()

@@ -10,3 +10,4 @@ from .db_handler import create_ds_indexes
 from . import argparser
 from .encoder import batch_encode_plus
 from .processor import greedy_processor
+from .np_params_handler import *

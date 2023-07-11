@@ -1128,11 +1128,18 @@ class BloomModelSeq(BloomModel):
                 self.h[i] = None
                 del del_ele
         # for each layer, start sharding
+        load_in_np = os.environ.get('LOAD_IN_NP', '0') == '1'
         for layer_idx in layer_idxs:
             layer = self.h[layer_idx]
             if layer is None:
                 self.h[layer_idx] = BloomBlockSharded(self.config).to(torch.float16)
                 print("create layer:", layer_idx, end="|")
+                if load_in_np:
+                    np_weight_folder_path = os.environ.get('NP_WEIGHT_FOLDER', False)
+                    if not np_weight_folder_path:
+                        raise ValueError("Please set NP_WEIGHT_FOLDER")
+                    # load weight from np
+                    self.layers[layer_idx] = qllm_utils.load_np_weight_bloom_layer(np_weight_folder_path, layer_idx, self.layers[layer_idx])
             self.h[layer_idx].shard(sharding_strategy[layer_idx])
             self.h[layer_idx].eval() # use eval mode
             # directly move to device

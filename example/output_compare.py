@@ -4,10 +4,12 @@
 # generation reference for the bloom and opt
 from qllm.utils import batch_encode_plus, to_device_recursive
 from qllm.utils.argparser import model_config_argparser
-from qllm.models import bloom, opt, qllm_load_pretrained_from_size
+from qllm.models import bloom, opt, qllm_load_pretrained_from_size, init_tokenizer, create_empty_model
 from qllm.utils import batch_encode_plus
+import qllm.utils as qllm_utils
 import torch 
 import os 
+from example_utils import create_uniform_sharding_strategies
 
 args = model_config_argparser()
 model_name = args.model_name
@@ -18,11 +20,28 @@ if model_name == 'bloom':
     ref_model, tokenizer = bloom.load_pretained_model_from_net(key)
     ref_model.eval()
 elif model_name == 'opt':
-    # use converted weight
-    path = os.path.join(target_storage_folder, f"{model_name}_{model_size}")
-    if not os.path.exists(path):
-        raise ValueError("Please run weight_convert.py first")
-    qllm_model, _, key = qllm_load_pretrained_from_size(model_name, model_size, target_storage_folder=target_storage_folder)
+    load_in_np = os.environ.get('LOAD_IN_NP', '0') == '1'
+    if load_in_np:
+        # specify the np weight folder
+        os.environ['NP_WEIGHT_FOLDER'] = os.environ.get('NP_WEIGHT_FOLDER', '/data/llms/converted_weights_np') + f"/{model_name}_{model_size}"
+        # load model with empty
+        os.environ['SET_DECODERS_META'] = "1"
+        # check path
+        if not os.path.exists(os.environ['NP_WEIGHT_FOLDER']):
+            raise ValueError("Please run weight_convert.py first")
+        qllm_model = create_empty_model(model_name, model_size)
+        qllm_utils.load_np_weight_opt_non_layer(os.environ['NP_WEIGHT_FOLDER'], qllm_model)
+        tokenizer, key = init_tokenizer(model_name, model_size)
+        # load weight through shard api
+        decoder_layer_nums = qllm_model.get_decoder_layer_num()
+        sharding_strategy = create_uniform_sharding_strategies(1, decoder_layer_nums, 16)
+        qllm_model.model.decoder._shard_decoders(sharding_strategy[0])
+    else:
+        # use converted weight
+        path = os.path.join(target_storage_folder, f"{model_name}_{model_size}")
+        if not os.path.exists(path):
+            raise ValueError("Please run weight_convert.py first")
+        qllm_model, _, key = qllm_load_pretrained_from_size(model_name, model_size, target_storage_folder=target_storage_folder)
     ref_model, tokenizer = opt.load_pretained_model_from_net(key)
     ref_model.eval()
 

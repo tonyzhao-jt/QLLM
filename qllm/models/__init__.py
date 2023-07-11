@@ -82,6 +82,14 @@ def qllm_load_pretrained_from_size(model_name, model_size, torch_dtype=torch.flo
     loaded_llm_cpu.eval()
     return loaded_llm_cpu, tokenizer, key
 
+def init_tokenizer(model_name, model_size):
+    if model_name == 'opt':
+        key = opt.get_model_size_key(model_size)
+    elif model_name == 'bloom':
+        key = bloom.get_model_size_key(model_size)
+    tokenizer = AutoTokenizer.from_pretrained(key)
+    return tokenizer, key
+
 def return_config_name(model_config):
     if isinstance(model_config, OPTConfig):
         return 'opt'

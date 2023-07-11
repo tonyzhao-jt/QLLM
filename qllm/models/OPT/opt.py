@@ -20,6 +20,8 @@ model_cards = {
         word_embed_proj_dim=512,
         num_hidden_layers=24,
         num_attention_heads=16,
+        _remove_final_layer_norm=False,
+        do_layer_norm_before=False,
     ),
     '1.3b': OPTConfig(
         hidden_size=2048,
