@@ -11,3 +11,4 @@ from . import argparser
 from .encoder import batch_encode_plus
 from .processor import greedy_processor
 from .np_params_handler import *
+from .sample_strategy_gen import *

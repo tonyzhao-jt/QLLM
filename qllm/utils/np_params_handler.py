@@ -10,11 +10,12 @@ def load_np_weight_opt_non_layer(folder_path, model):
         'lm_head.weight',
         'model.decoder.embed_positions.weight',
         'model.decoder.embed_tokens.weight',
-        'model.decoder.final_layer_norm.bias',
-        'model.decoder.final_layer_norm.weight',
-        # proj in and out, may not exists
+
+    # proj in and out, may not exists
     ]
     model_weight_may_not_exists = [
+        'model.decoder.final_layer_norm.bias',
+        'model.decoder.final_layer_norm.weight',
         "model.decoder.project_in.weight",
         "model.decoder.project_out.weight",
     ]
@@ -45,8 +46,9 @@ def load_np_weight_opt_non_layer(folder_path, model):
     # embed_tokens
     model.model.decoder.embed_tokens.weight.data = torch.from_numpy(loaded_weight['model.decoder.embed_tokens.weight'])
     # final_layer_norm
-    model.model.decoder.final_layer_norm.bias.data = torch.from_numpy(loaded_weight['model.decoder.final_layer_norm.bias'])
-    model.model.decoder.final_layer_norm.weight.data = torch.from_numpy(loaded_weight['model.decoder.final_layer_norm.weight'])
+    if "model.decoder.final_layer_norm.bias" in loaded_weight:
+        model.model.decoder.final_layer_norm.bias.data = torch.from_numpy(loaded_weight['model.decoder.final_layer_norm.bias'])
+        model.model.decoder.final_layer_norm.weight.data = torch.from_numpy(loaded_weight['model.decoder.final_layer_norm.weight'])
 
     # check if the proj in and out exists
     if "model.decoder.project_in.weight" in loaded_weight:
