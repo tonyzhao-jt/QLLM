@@ -1,7 +1,7 @@
 from qllm.models import create_empty_model
 import torch 
 import os 
-from qpipe.partitioner.helper import create_mem_estimator
+from shaq.partitioner.helper import create_mem_estimator
 from qllm.models.BLOOM.bloom import model_cards
 # from qllm.models.OPT.opt import model_cards
 from qllm.utils import get_model_size_cuda
