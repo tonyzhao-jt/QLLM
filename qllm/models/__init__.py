@@ -8,7 +8,6 @@ from transformers import (
 )
 import torch
 
-
 def create_model_config(model_name, model_size):
     if model_name == 'opt':
         model_cards = opt.model_cards
@@ -81,6 +80,15 @@ def qllm_load_pretrained_from_size(model_name, model_size, torch_dtype=torch.flo
     loaded_llm_cpu = load_qllm_weight(QLLM_LM, model_name, model_size, target_storage_folder, torch_dtype, key=key)
     loaded_llm_cpu.eval()
     return loaded_llm_cpu, tokenizer, key
+
+def get_decoder_layer_nums(model_name, model_size):
+    config = create_model_config(model_name, model_size)
+    if model_name == 'opt':
+        return config.num_hidden_layers
+    elif model_name == 'bloom':
+        return config.n_layer
+    else:
+        raise Exception(f"model name {model_name} not supported")
 
 def init_tokenizer(model_name, model_size):
     if model_name == 'opt':
