@@ -268,15 +268,21 @@ class BloomAttention(nn.Module):
         v_shape = (b * self.num_heads, max_seq_len, self.head_dim)
         params = list(self.query_key_value.parameters())
         device = params[0].device
-        self.kv_cache[request_id] = (
+        self.kv_cache[request_id] = [
             torch.empty(k_shape, dtype=torch_dtype, device=device),
             torch.empty(v_shape, dtype=torch_dtype, device=device)
-        ) 
+        ]
         if init_with_xavier:
             nn.init.xavier_uniform_(self.kv_cache[request_id][0])
             nn.init.xavier_uniform_(self.kv_cache[request_id][1])
         self.kv_status[request_id] = [0, prompt_length]
-    
+
+    @torch.no_grad()
+    def kv_cache_to_device(self, device):
+        for request_id in self.kv_cache:
+            self.kv_cache[request_id][0] = self.kv_cache[request_id][0].to(device)
+            self.kv_cache[request_id][1] = self.kv_cache[request_id][1].to(device)
+
     @torch.no_grad()
     def _reset_kv_status(self):
         for request_id in self.kv_status:

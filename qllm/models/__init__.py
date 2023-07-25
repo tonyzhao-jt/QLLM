@@ -1,6 +1,6 @@
-from .LLaMa import llama
 from .OPT import opt, OPTForCausalLMSeq, OPTDecoderLayerSharded
 from .BLOOM import bloom, BloomForCausalLMSeq, BloomBlockSharded
+from .Llama import llama
 from transformers import (
     BloomConfig,
     OPTConfig,
@@ -17,6 +17,12 @@ def create_model_config(model_name, model_size):
         model_cards = bloom.model_cards
         assert model_size in model_cards, f"model size {model_size} is not in model cards {model_cards.keys()}"
         config = model_cards[model_size]
+    elif model_name == 'llama':
+        model_cards = llama.model_cards
+        assert model_size in model_cards, f"model size {model_size} is not in model cards {model_cards.keys()}"
+        config = model_cards[model_size]
+    else:
+        raise Exception(f"model name {model_name} not supported")
     return config
 
 def create_empty_model(model_name, model_size, torch_dtype=torch.float16):
@@ -87,6 +93,8 @@ def get_decoder_layer_nums(model_name, model_size):
         return config.num_hidden_layers
     elif model_name == 'bloom':
         return config.n_layer
+    elif model_name == 'llama':
+        return config.num_hidden_layers
     else:
         raise Exception(f"model name {model_name} not supported")
 

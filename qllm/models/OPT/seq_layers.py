@@ -212,6 +212,11 @@ class Int8OPTAttention(nn.Module):
         if init_with_xavier:
             nn.init.xavier_uniform_(self.kv_cache[request_id])
         self.kv_status[request_id] = [0, prompt_length]
+    
+    @torch.no_grad()
+    def kv_cache_to_device(self, device):
+        for request_id in self.kv_cache:
+            self.kv_cache[request_id] = self.kv_cache[request_id].to(device)
 
     @torch.no_grad()
     def _reset_kv_status(self):
@@ -500,6 +505,11 @@ class OPTAttentionSeq(nn.Module):
         if init_with_xavier:
             nn.init.xavier_uniform_(self.kv_cache[request_id])
         self.kv_status[request_id] = [0, prompt_length]
+    
+    @torch.no_grad()
+    def kv_cache_to_device(self, device):
+        for request_id in self.kv_cache:
+            self.kv_cache[request_id] = self.kv_cache[request_id].to(device)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
