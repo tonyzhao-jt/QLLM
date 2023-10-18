@@ -1,29 +1,29 @@
 import torch
 # Wait decapoca merged
 from transformers import (
-    LlamaForCausalLM as LLMCasualLM,
-    LlamaConfig as LLMConfig,
+    LlamaForCausalLM,
+    LlamaConfig,
     AutoTokenizer
 )
 # from transformers import (
-#     LLaMAForCausalLM as LLMCasualLM,
-#     LLaMAConfig as LLMConfig,
+#     LLaMAForCausalLM asLlamaForCausalLM,
+#     LLaMAConfig as LlamaConfig,
 #     AutoTokenizer
 # )
 
 # according to its original paper: https://arxiv.org/pdf/2302.13971.pdf
 model_cards = {
-    '7b': LLMConfig(
+    '7b': LlamaConfig(
         hidden_size=4096,
         num_hidden_layers=32,
         num_attention_heads=32,
     ),
-    '13b': LLMConfig(
+    '13b': LlamaConfig(
         hidden_size=5120,
         num_hidden_layers=40,
         num_attention_heads=40,
     ),
-    '70b': LLMConfig(
+    '70b': LlamaConfig(
         hidden_size=6656,
         num_hidden_layers=60,
         num_attention_heads=52,
@@ -39,7 +39,7 @@ def get_empty_model(model_size:str='7b'):
     torch.nn.init.normal_ = skip
     config = model_cards[model_size]
     # model = LlamaModel(config)
-    model = LLMCasualLM(config)
+    model = LlamaForCausalLM(config)
     tokenizer = AutoTokenizer.from_pretrained("decapoda-research/llama-7b-hf")
     return model, tokenizer
 
@@ -55,7 +55,7 @@ AVAILABLE_MAP = {
 
 def load_pretained_model_from_net(repo_name):
     assert repo_name in AVAILABLE_MAP, f"model {repo_name} not available in repo"
-    model = LLMCasualLM.from_pretrained(repo_name)
+    model =LlamaForCausalLM.from_pretrained(repo_name)
     tokenizer = AutoTokenizer.from_pretrained(repo_name)
     return model, tokenizer
 

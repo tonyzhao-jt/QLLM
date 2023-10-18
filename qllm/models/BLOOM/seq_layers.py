@@ -1145,19 +1145,13 @@ class BloomModelSeq(BloomModel):
                     if not np_weight_folder_path:
                         raise ValueError("Please set NP_WEIGHT_FOLDER")
                     # load weight from np
-                    self.layers[layer_idx] = qllm_utils.load_np_weight_bloom_layer(np_weight_folder_path, layer_idx, self.layers[layer_idx])
+                    self.h[layer_idx] = qllm_utils.load_np_weight_bloom_layer(np_weight_folder_path, layer_idx, self.h[layer_idx])
             self.h[layer_idx].shard(sharding_strategy[layer_idx])
             self.h[layer_idx].eval() # use eval mode
             # directly move to device
             if device is not None:
                 self.h[layer_idx] = self.h[layer_idx].to(device)
     
-    def load_layer_weight(self, shard_weight_dir):
-        pass
-        # for layer in self.h:
-        #     if layer is not None:
-        #         layer.load_weight()
-
     @torch.no_grad()
     def verify_decoder_layers(self):
         for layer in self.h:

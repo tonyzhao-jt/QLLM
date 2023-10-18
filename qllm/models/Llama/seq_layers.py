@@ -35,11 +35,11 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from ...activations import ACT2FN
-from ...modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
-from ...modeling_utils import PreTrainedModel
-from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
-from .configuration_llama import LlamaConfig
+from transformers.activations import ACT2FN
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+from transformers.modeling_utils import PreTrainedModel
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
+from transformers import LlamaConfig
 
 
 
@@ -927,11 +927,9 @@ class LlamaForCausalLMSeq(LlamaForCausalLM):
         return reordered_past
 
 
-
-
 if __name__ == '__main__':
     from qllm.models import llama, get_decoder_layer_nums
-    from qllm.utils import get_model_size
+    from qllm.utils import get_model_size, create_uniform_sharding_strategies
     key = 'decapoda-research/llama-7b-hf'
     model_name = 'llama'
     model_size = '7b'
@@ -947,27 +945,10 @@ if __name__ == '__main__':
         res_1 = model(input_ids)
         res_2 = llama_7b(input_ids)
     print(torch.allclose(res_1.logits, res_2.logits))
-    # sharding_strategy = {
-    #     0: {
-    #         0: {'shard': [0, 1], 'bits': [8, 8]},
-    #         1: {'shard': [0, 1], 'bits': [8, 8]},
-    #         2: {'shard': [0, 1], 'bits': [8, 8]},
-    #         3: {'shard': [0, 1], 'bits': [8, 8]},
-    #         4: {'shard': [0, 1], 'bits': [8, 8]},
-    #         5: {'shard': [0, 1], 'bits': [8, 8]},
-    #         6: {'shard': [0], 'bits': [8]},
-    #     },
-    #     1: {
-    #         6: {'shard': [1], 'bits': [8]},
-    #         7: {'shard': [0,1], 'bits': [8, 8]},
-    #         8: {'shard': [0,1], 'bits': [8, 8]},
-    #     },
-    #     2: {
-    #         9: {'shard': [0,1], 'bits': [8, 8]},
-    #         10: {'shard': [0,1], 'bits': [8, 8]},
-    #         11: {'shard': [0,1], 'bits': [8, 8]},
-    #     }
-    # }
+    shards_num = 2
+    bitwidth = '8:tc-li'
+    strategy = create_uniform_sharding_strategies(shards_num, decoder_layer_nums, bitwidth)
+    
     # model._shard_model(sharding_strategy, 0)
     # model_2._shard_model(sharding_strategy, 1)
     # model_3._shard_model(sharding_strategy, 2)

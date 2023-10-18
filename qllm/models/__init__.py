@@ -1,7 +1,8 @@
 from .OPT import opt, OPTForCausalLMSeq, OPTDecoderLayerSharded
 from .BLOOM import bloom, BloomForCausalLMSeq, BloomBlockSharded
-from .Llama import llama
-from transformers import (
+# from .Llama import llama
+from .Llama import llama2 as llama # use llama2 for now
+from transformers import ( 
     BloomConfig,
     OPTConfig,
     AutoTokenizer,

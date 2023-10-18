@@ -1,34 +1,35 @@
 import torch
 # Wait decapoca merged
 from transformers import (
-    LlamaForCausalLM as LLMCasualLM,
-    LlamaConfig as LLMConfig,
-    AutoTokenizer
+    LlamaForCausalLM,
+    LlamaConfig,
+    AutoTokenizer,
+    LlamaTokenizer
 )
 # from transformers import (
-#     LLaMAForCausalLM as LLMCasualLM,
-#     LLaMAConfig as LLMConfig,
+#     LLaMAForCausalLM as  LlamaForCausalLM,
+#     LLaMAConfig as LlamaConfig,
 #     AutoTokenizer
 # )
 
 # according to its original paper: https://arxiv.org/pdf/2302.13971.pdf
 model_cards = {
-    '7b': LLMConfig(
+    '7b': LlamaConfig(
         hidden_size=4096,
         num_hidden_layers=32,
         num_attention_heads=32,
     ),
-    '13b': LLMConfig(
+    '13b': LlamaConfig(
         hidden_size=5120,
         num_hidden_layers=40,
         num_attention_heads=40,
     ),
-    '33b': LLMConfig(
+    '33b': LlamaConfig(
         hidden_size=6656,
         num_hidden_layers=60,
         num_attention_heads=52,
     ),
-    '65b': LLMConfig(
+    '65b': LlamaConfig(
         hidden_size=8192,
         num_hidden_layers=80,
         num_attention_heads=64,
@@ -44,8 +45,8 @@ def get_empty_model(model_size:str='7b'):
     torch.nn.init.normal_ = skip
     config = model_cards[model_size]
     # model = LlamaModel(config)
-    model = LLMCasualLM(config)
-    tokenizer = AutoTokenizer.from_pretrained("decapoda-research/llama-7b-hf")
+    model =  LlamaForCausalLM(config)
+    tokenizer = LlamaTokenizer.from_pretrained("decapoda-research/llama-7b-hf")
     return model, tokenizer
 
 def get_available_models():
@@ -62,8 +63,8 @@ AVAILABLE_MAP = {
 
 def load_pretained_model_from_net(repo_name):
     assert repo_name in AVAILABLE_MAP, f"model {repo_name} not available in repo"
-    model = LLMCasualLM.from_pretrained(repo_name)
-    tokenizer = AutoTokenizer.from_pretrained(repo_name)
+    model =  LlamaForCausalLM.from_pretrained(repo_name)
+    tokenizer = LlamaTokenizer.from_pretrained(repo_name)
     return model, tokenizer
 
 def get_available_pretained_models():
