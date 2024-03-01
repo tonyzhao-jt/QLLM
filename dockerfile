@@ -6,6 +6,7 @@ RUN apt-get update && apt-get install -y \
     git ffmpeg libsm6 libxext6 ca-certificates curl jq wget \
     git-lfs
 
+ENV PERF_MODE=1
 
 CMD echo "===========END========="
 CMD /bin/bash
